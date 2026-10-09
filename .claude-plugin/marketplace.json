@@ -11,7 +11,7 @@
     {
       "name": "session-status",
       "source": "./plugins/session-status",
-      "description": "Colored band above the prompt with git branch, work item, model, context usage, CPU/RAM/temperature (Windows only) and a work-item active-time timer"
+      "description": "Colored band above the prompt with work item, active-time timer, git branch, context usage, CPU/RAM/temperature (Windows only)"
     }
   ]
 }

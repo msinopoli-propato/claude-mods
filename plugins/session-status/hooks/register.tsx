@@ -31,7 +31,6 @@ export const findWorkItem = (...candidates: readonly string[]) => {
 // Everything the band draws lives in $.state so a hot reload keeps it and the render hook only reads.
 const branch = atom({ plugin: 'session-status', key: 'branch' } as const, null)
 const workItem = atom({ plugin: 'session-status', key: 'workItem' } as const, null)
-const model = atom({ plugin: 'session-status', key: 'model' } as const, null)
 const context = atom({ plugin: 'session-status', key: 'context' } as const, null)
 const health = atom({ plugin: 'session-status', key: 'health' } as const, null)
 const run = atom({ plugin: 'session-status', key: 'run' } as const, null)
@@ -54,10 +53,9 @@ const detectWorkItem = (name: string | undefined, cwd: string) =>
   findWorkItem(name ?? '', cwd.replaceAll('\\', '/'))
 
 const refresh = async ($: Engine) => {
-  const [current, cwd, modelName, usage] = await Promise.all([
+  const [current, cwd, usage] = await Promise.all([
     readBranch($).catch(() => undefined),
     $.session.cwd(),
-    $.session.model(),
     $.session.usage(),
   ])
 
@@ -68,7 +66,6 @@ const refresh = async ($: Engine) => {
   await Promise.all([
     update($, branch, () => current ?? null),
     update($, workItem, () => detectWorkItem(current?.name, cwd) ?? null),
-    update($, model, () => modelName),
     update($, context, () => ctx),
   ])
 }
@@ -189,7 +186,6 @@ export const register: Register = on => {
     const segments = buildSegments({
       branch: await read($, branch),
       workItem: await read($, workItem),
-      model: await read($, model),
       context: await read($, context),
       health: await read($, health),
       run: await read($, run),

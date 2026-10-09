@@ -40,7 +40,6 @@ const world = (on: any, w: World = {}) => {
     return e.argv.includes('rev-parse') ? ok(`${w.branch}\n`) : ok(w.porcelain ?? '')
   })
   on('session.cwd', () => ({ value: w.cwd ?? 'C:\\Repos\\app' }))
-  on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('session.usage', () => ({
     value: {
       startedAt: 0,
@@ -92,6 +91,7 @@ const drawBand = async ($: any, surface: (typeof SURFACES)[number], props: objec
 }
 
 const segmentsOf = (all: Segment[]) => all.filter(s => s.text !== ' · ')
+const branchOf = (all: Segment[]) => segmentsOf(all).find(s => s.text.startsWith('⎇'))
 
 const compose = ($: any) =>
   $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] })
@@ -114,11 +114,10 @@ for (const surface of SURFACES) {
     await $.turn.complete(turn())
     const all = await drawBand($, surface)
 
-    expect(all.map(s => s.text).join('')).toBe('⎇ feature/issue-8423* · WI #8423 · claude-opus-5-5 · ctx 42% (84k)')
-    const [branch, wi, model, ctx] = segmentsOf(all)
+    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-8423* · ctx 42% (84k)')
+    const [wi, branch, ctx] = segmentsOf(all)
     expect(branch.color).toBe('warning')
     expect(wi).toMatchObject({ color: 'claude', bold: true })
-    expect(model.color).toBe('suggestion')
     expect(ctx.color).toBe('success')
     expect(all.filter(s => s.text === ' · ').every(s => s.dimColor === true)).toBe(true)
   })
@@ -130,28 +129,56 @@ for (const surface of SURFACES) {
       await clock.advance(9 * MINUTE) // 81 minutes of steady activity: 1.35h
       await $.turn.complete(turn())
     }
-    const timer = segmentsOf(await drawBand($, surface)).at(-1)!
-    expect(timer).toMatchObject({ text: '⏱ WI #8423 1.3h', color: 'permission' })
+    const all = await drawBand($, surface)
+    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⏱ 1.3h · ⎇ feature/issue-8423 · ctx 10%')
+    expect(segmentsOf(all)[1]).toMatchObject({ text: '⏱ 1.3h', color: 'permission' })
   })
 }
+
+test('an active run wins over the branch work item and WI is shown once', async ($, on) => {
+  world(on, { branch: 'feature/issue-1111', percent: 10 })
+  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await $.turn.complete(turn())
+  const all = await drawBand($, 'terminal')
+  expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⏱ 0.0h · ⎇ feature/issue-1111 · ctx 10%')
+})
+
+test('a run with unknown work item and no branch work item shows WI ?', async ($, on) => {
+  world(on, { branch: 'desarrollo' })
+  await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' })
+  await $.turn.complete(turn())
+  const all = await drawBand($, 'terminal')
+  expect(all.map(s => s.text).join('')).toBe('WI ? · ⏱ 0.0h · ⎇ desarrollo')
+  expect(segmentsOf(all)[0]).toMatchObject({ color: 'claude', bold: true })
+})
+
+test('a run with unknown work item falls back to the branch work item', async ($, on) => {
+  const w: World = { branch: 'desarrollo' }
+  world(on, w)
+  await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' }) // unknown at start
+  w.branch = 'feature/issue-77'
+  await $.turn.complete(turn())
+  const all = await drawBand($, 'terminal')
+  expect(all.map(s => s.text).join('')).toBe('WI #77 · ⏱ 0.0h · ⎇ feature/issue-77')
+})
 
 test('clean branch is green, protected branches are bold red even when clean', async ($, on) => {
   const w: World = { branch: 'feature/issue-5' }
   world(on, w)
   await $.turn.complete(turn())
-  expect(segmentsOf(await drawBand($, 'terminal'))[0]).toMatchObject({ text: '⎇ feature/issue-5', color: 'success' })
+  expect(branchOf(await drawBand($, 'terminal'))).toMatchObject({ text: '⎇ feature/issue-5', color: 'success' })
 
   for (const name of ['main', 'master', 'dev', 'desarrollo', 'UAT']) {
     w.branch = name
     await $.turn.complete(turn())
-    expect(segmentsOf(await drawBand($, 'terminal'))[0]).toMatchObject({ text: `⎇ ${name}`, color: 'error', bold: true })
+    expect(branchOf(await drawBand($, 'terminal'))).toMatchObject({ text: `⎇ ${name}`, color: 'error', bold: true })
   }
 })
 
 test('dirty protected branch stays red and shows the asterisk', async ($, on) => {
   world(on, { branch: 'main', porcelain: ' M a.cs\n' })
   await $.turn.complete(turn())
-  expect(segmentsOf(await drawBand($, 'desktop'))[0]).toMatchObject({ text: '⎇ main*', color: 'error', bold: true })
+  expect(branchOf(await drawBand($, 'desktop'))).toMatchObject({ text: '⎇ main*', color: 'error', bold: true })
 })
 
 test('context color follows the thresholds', async ($, on) => {
@@ -170,14 +197,14 @@ test('reads the work item from a Windows worktree path', async ($, on) => {
   world(on, { branch: 'desarrollo', cwd: 'C:\\Repos\\worktrees\\stock-api-issue-912' })
   await $.turn.complete(turn())
   const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('⎇ desarrollo · WI #912 · claude-opus-5-5')
+  expect(all.map(s => s.text).join('')).toBe('WI #912 · ⎇ desarrollo')
 })
 
-test('outside a git repo it shows only the model and usage', async ($, on) => {
+test('outside a git repo it shows only the work item, if any, and usage', async ($, on) => {
   world(on, { percent: 5 })
   await $.turn.complete(turn())
   const all = await drawBand($, 'desktop')
-  expect(all.map(s => s.text).join('')).toBe('claude-opus-5-5 · ctx 5%')
+  expect(all.map(s => s.text).join('')).toBe('ctx 5%')
 })
 
 test('ignores subagent turns', async ($, on) => {
@@ -273,8 +300,8 @@ test('unknown work item shows a question mark in the band', async ($, on) => {
   await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' })
   await $.turn.complete(turn())
   expect(await wiTime($)).toContain('WI ?')
-  const timer = segmentsOf(await drawBand($, 'terminal')).at(-1)!
-  expect(timer).toMatchObject({ text: '⏱ WI ? 0.0h', color: 'permission' })
+  const timer = segmentsOf(await drawBand($, 'terminal')).find(s => s.text.startsWith('⏱'))!
+  expect(timer).toMatchObject({ text: '⏱ 0.0h', color: 'permission' })
 })
 
 test('hours are rounded down, never up', async ($, on) => {
@@ -284,8 +311,8 @@ test('hours are rounded down, never up', async ($, on) => {
     await clock.advance(9 * MINUTE) // 99 minutes in total: 1.65h
     await $.turn.complete(turn())
   }
-  const timer = segmentsOf(await drawBand($, 'terminal')).at(-1)!
-  expect(timer.text).toBe('⏱ WI #8423 1.6h')
+  const timer = segmentsOf(await drawBand($, 'terminal')).find(s => s.text.startsWith('⏱'))!
+  expect(timer.text).toBe('⏱ 1.6h')
 })
 
 test('the session ending closes the run', async ($, on) => {
@@ -391,14 +418,14 @@ test('colors follow the thresholds of each metric', () => {
 })
 
 for (const surface of SURFACES) {
-  test(`band draws CPU, RAM and temperature between ctx and the timer on ${surface}`, async ($, on) => {
+  test(`band draws CPU, RAM and temperature after ctx on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 42, tokens: 84_200, health: SAMPLE })
     await start($, clock)
     await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
     const all = await drawBand($, surface)
 
     expect(all.map(s => s.text).join('')).toBe(
-      '⎇ feature/issue-8423 · WI #8423 · claude-opus-5-5 · ctx 42% (84k) · CPU 27% · RAM 75% · 62°C · ⏱ WI #8423 0.0h',
+      'WI #8423 · ⏱ 0.0h · ⎇ feature/issue-8423 · ctx 42% (84k) · CPU 27% · RAM 75% · 62°C',
     )
     const [, , , , cpu, ram, temp] = segmentsOf(all)
     expect([cpu.color, ram.color, temp.color]).toEqual(['success', 'warning', 'success'])
@@ -408,7 +435,7 @@ for (const surface of SURFACES) {
 test('colors reach the band per metric', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '95|1000|4000|3700' })
   await start($, clock)
-  const [, , cpu, ram, temp] = segmentsOf(await drawBand($, 'terminal'))
+  const [, cpu, ram, temp] = segmentsOf(await drawBand($, 'terminal'))
   expect([cpu, ram, temp].map(s => [s.text, s.color])).toEqual([
     ['CPU 95%', 'error'],
     ['RAM 75%', 'warning'],
@@ -420,19 +447,19 @@ test('missing temperature leaves CPU and RAM only', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '27|8195448|33177908|' })
   await start($, clock)
   const texts = (await drawBand($, 'terminal')).map(s => s.text).join('')
-  expect(texts).toBe('⎇ x · claude-opus-5-5 · CPU 27% · RAM 75%')
+  expect(texts).toBe('⎇ x · CPU 27% · RAM 75%')
 })
 
 test('a failing or unparsable read omits the whole segment', async ($, on) => {
   const failing = world(on, { branch: 'x' })
   await start($, failing.clock)
-  expect((await drawBand($, 'terminal')).map(s => s.text).join('')).toBe('⎇ x · claude-opus-5-5')
+  expect((await drawBand($, 'terminal')).map(s => s.text).join('')).toBe('⎇ x')
 })
 
 test('unparsable stdout omits the segment too', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: 'garbage' })
   await start($, clock)
-  expect((await drawBand($, 'desktop')).map(s => s.text).join('')).toBe('⎇ x · claude-opus-5-5')
+  expect((await drawBand($, 'desktop')).map(s => s.text).join('')).toBe('⎇ x')
 })
 
 test('reads on an interval of 20 seconds and redraws the new value', async ($, on) => {

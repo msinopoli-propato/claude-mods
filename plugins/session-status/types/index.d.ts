@@ -27,7 +27,6 @@ declare module 'claude-code' {
     'session-status': {
       branch: SessionStatusBranch | null
       workItem: string | null
-      model: string | null
       context: SessionStatusContext | null
       health: SessionStatusHealth | null
       run: SessionStatusRun | null

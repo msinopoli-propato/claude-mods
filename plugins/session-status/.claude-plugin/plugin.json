@@ -1,7 +1,7 @@
 {
   "name": "session-status",
-  "version": "0.3.0",
-  "description": "Colored band above the prompt with git branch, work item, model, context usage, CPU/RAM/temperature (Windows only) and a work-item active-time timer",
+  "version": "0.4.0",
+  "description": "Colored band above the prompt with work item, active-time timer, git branch, context usage, CPU/RAM/temperature (Windows only)",
   "author": { "name": "msinopoli" },
   "types": "./types/index.d.ts"
 }

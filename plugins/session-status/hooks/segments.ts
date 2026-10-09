@@ -2,14 +2,13 @@ import type { Color } from 'claude-code'
 
 import type { SessionStatusBranch, SessionStatusContext, SessionStatusHealth, SessionStatusRun } from '../types'
 import { healthColors } from './health'
-import { formatHours, workItemLabel } from './timer'
+import { formatHours } from './timer'
 
 export type Segment = { text: string; color?: Color; bold?: true; dimColor?: true }
 
 export type BandData = {
   branch: SessionStatusBranch | null
   workItem: string | null
-  model: string | null
   context: SessionStatusContext | null
   health: SessionStatusHealth | null
   run: SessionStatusRun | null
@@ -32,9 +31,14 @@ const branchSegment = ({ name, isDirty }: SessionStatusBranch): Segment => {
 export const buildSegments = (data: BandData): Segment[] => {
   const segments: Segment[] = []
 
+  // WI is shown once, first: the active run's work item wins over the branch's; `WI ?` only for a run with neither.
+  const workItem = data.run?.workItem ?? data.workItem
+  if (workItem) segments.push({ text: `WI #${workItem}`, color: 'claude', bold: true })
+  else if (data.run) segments.push({ text: 'WI ?', color: 'claude', bold: true })
+
+  if (data.run) segments.push({ text: `⏱ ${formatHours(data.run.activeMs)}h`, color: 'permission' })
+
   if (data.branch) segments.push(branchSegment(data.branch))
-  if (data.workItem) segments.push({ text: `WI #${data.workItem}`, color: 'claude', bold: true })
-  if (data.model) segments.push({ text: data.model, color: 'suggestion' })
 
   const percent = data.context?.percent
   if (percent !== null && percent !== undefined) {
@@ -48,13 +52,6 @@ export const buildSegments = (data: BandData): Segment[] => {
     segments.push({ text: `CPU ${data.health.cpu}%`, color: colors.cpu })
     segments.push({ text: `RAM ${data.health.ram}%`, color: colors.ram })
     if (data.health.tempC !== null) segments.push({ text: `${data.health.tempC}°C`, color: colors.temp })
-  }
-
-  if (data.run) {
-    segments.push({
-      text: `⏱ ${workItemLabel(data.run)} ${formatHours(data.run.activeMs)}h`,
-      color: 'permission',
-    })
   }
 
   return segments
