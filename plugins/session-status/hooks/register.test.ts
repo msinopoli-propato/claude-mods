@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { parseHealth, healthColors } from './health'
+import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
 
 type World = {
@@ -20,6 +21,12 @@ type World = {
   agentsGate?: Promise<void>
   agentListCalls?: number
   spawnId?: string
+  // Azure CLI read: the work item title (undefined -> the command fails), calls seen and an optional gate.
+  azTitle?: string
+  azCalls?: number
+  azArgv?: { argv: readonly string[]; init?: { timeoutMs?: number } }
+  azGate?: Promise<void>
+  store?: Record<string, unknown>
 }
 
 const MINUTE = 60_000
@@ -36,6 +43,13 @@ const world = (on: any, w: World = {}) => {
   const registered: string[] = []
   const clock = mock.clock(on, { now: T0 })
   on('process.run', async (_$: unknown, e: { argv: readonly string[]; init?: { timeoutMs?: number } }) => {
+    if (e.argv[0] === 'cmd') {
+      w.azCalls = (w.azCalls ?? 0) + 1
+      w.azArgv = e
+      await w.azGate
+      if (w.azTitle === undefined) return fail
+      return ok(JSON.stringify({ 'System.Title': w.azTitle, 'System.State': 'Active' }))
+    }
     if (e.argv[0] === 'powershell') {
       w.healthCalls = (w.healthCalls ?? 0) + 1
       w.healthArgv = e
@@ -70,6 +84,9 @@ const world = (on: any, w: World = {}) => {
     return { value: snapshot.map(a => ({ description: 'task', type: 'general-purpose', ...a })) }
   })
   on('agent.spawn', () => ({ model: 'm', agentId: w.spawnId ?? 'spawned-1' }))
+  on('classic.UserPromptSubmit', () => ({}))
+  on('classic.SessionStart', () => ({}))
+  mock.store(on, w.store ?? {})
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'base', scope: 'shared' }] }))
   // The engine's own AbovePrompt: an empty box, drawn when the plugin passes.
   on('ui.render', () => ({ type: 'Box', props: {}, children: [] }))
@@ -701,4 +718,131 @@ test('the session ending forgets the tally', async ($, on) => {
   await $.session.end({ reason: 'clear', sessionId: 's1', resume: {} as never })
   const w2 = await bandText($)
   expect(w2.includes('🤖')).toBe(false)
+})
+
+// ---------------------------------------------------------------- session title
+
+const titleOf = async ($: any) => (await $.classic.UserPromptSubmit({ prompt: 'hi' })).sessionTitle as string | undefined
+
+test('composes the title from work item, description and context', () => {
+  expect(composeTitle('8423', 'Licenses endpoint', 42)).toBe('WI #8423 · Licenses endpoint · ctx 42%')
+  expect(composeTitle('8423', undefined, 42)).toBe('WI #8423 · ctx 42%')
+  expect(composeTitle('8423', 'Licenses endpoint', undefined)).toBe('WI #8423 · Licenses endpoint')
+  expect(composeTitle('8423', undefined, undefined)).toBe('WI #8423')
+})
+
+test('descriptions are trimmed, collapsed and cut to 40 characters with an ellipsis', () => {
+  expect(describeTitle('  Connector.Visma \n  -   BE  ')).toBe('Connector.Visma - BE')
+  expect(describeTitle('a'.repeat(40))).toBe('a'.repeat(40))
+  expect(describeTitle('a'.repeat(50))).toBe(`${'a'.repeat(39)}…`)
+  expect(describeTitle('   ')).toBe(undefined)
+})
+
+test('extracts System.Title from the az JSON and ignores garbage', () => {
+  expect(parseWorkItemTitle('{"System.Title":"Hello","x":1}')).toBe('Hello')
+  expect(parseWorkItemTitle('not json')).toBe(undefined)
+  expect(parseWorkItemTitle('{"System.State":"Active"}')).toBe(undefined)
+  expect(parseWorkItemTitle('{"System.Title":""}')).toBe(undefined)
+})
+
+test('no work item, no title', async ($, on) => {
+  world(on, { branch: 'main', percent: 42 })
+  await $.turn.complete(turn())
+  const result = await $.classic.UserPromptSubmit({ prompt: 'hi' })
+  expect(result.sessionTitle).toBe(undefined)
+})
+
+test('an uncached title is set without the description and never awaits az', async ($, on) => {
+  let release!: () => void
+  const w: World = { branch: 'feature/issue-8423', percent: 42, azTitle: 'Licenses endpoint', azGate: new Promise<void>(r => (release = r)) }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+
+  expect(await titleOf($)).toBe('WI #8423 · ctx 42%') // resolved while az has not even finished
+  await clock.settle()
+  expect(w.azCalls).toBe(1)
+  release()
+  await clock.settle()
+
+  expect(await titleOf($)).toBe('WI #8423 · Licenses endpoint · ctx 42%') // the next prompt picks it up
+})
+
+test('the az call is a cmd /d /s /c argv with a 15 second timeout', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423', azTitle: 'T' }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  await titleOf($)
+  await clock.settle()
+  expect(w.azArgv?.argv).toEqual([
+    'cmd', '/d', '/s', '/c', 'az', 'boards', 'work-item', 'show', '--id', '8423',
+    '--organization', 'https://dev.azure.com/propato', '--query', 'fields', '-o', 'json',
+  ])
+  expect(w.azArgv?.init?.timeoutMs).toBe(15_000)
+})
+
+test('a cached title is used and az never runs', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423', percent: 42, azTitle: 'Other', store: { 'wi-title:8423': 'Cached title' } }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  expect(await titleOf($)).toBe('WI #8423 · Cached title · ctx 42%')
+  await clock.settle()
+  expect(w.azCalls).toBe(undefined)
+})
+
+test('long cached titles are truncated in the session title', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Connector.Visma - BE Endpoint de listado de licencias' } })
+  await $.turn.complete(turn())
+  expect(await titleOf($)).toBe('WI #8423 · Connector.Visma - BE Endpoint de listad…')
+})
+
+test('an unknown context percent drops the ctx part', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Cached' } })
+  await $.turn.complete(turn())
+  expect(await titleOf($)).toBe('WI #8423 · Cached')
+})
+
+test('concurrent prompts fetch each work item once', async ($, on) => {
+  let release!: () => void
+  const w: World = { branch: 'feature/issue-8423', azTitle: 'T', azGate: new Promise<void>(r => (release = r)) }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  await titleOf($)
+  await clock.settle()
+  await titleOf($)
+  await titleOf($)
+  await clock.settle()
+  expect(w.azCalls).toBe(1)
+  release()
+  await clock.settle()
+})
+
+test('failures are silent, cache nothing and retry once per session', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423', percent: 10 } // azTitle undefined: az fails
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  for (let i = 0; i < 4; i++) {
+    expect(await titleOf($)).toBe('WI #8423 · ctx 10%')
+    await clock.settle()
+  }
+  expect(w.azCalls).toBe(2)
+})
+
+test('an active run work item wins over the branch one', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:9001': 'Run item' } })
+  await $.prompt.submit({ text: '/prosuite-comandos:work-item 9001' })
+  expect(await titleOf($)).toBe('WI #9001 · Run item')
+})
+
+test('the title is also set when the session starts', async ($, on) => {
+  const { clock } = world(on, { branch: 'feature/issue-8423', percent: 5, store: { 'wi-title:8423': 'Cached' } })
+  await $.session.start({ cwd: 'C:\\Repos\\app', surface: 'terminal', isInteractive: true })
+  await clock.settle()
+  const result = await $.classic.SessionStart({ source: 'startup' })
+  expect(result.sessionTitle).toBe('WI #8423 · Cached · ctx 5%')
+})
+
+test('only a numeric work item id can reach cmd', () => {
+  expect(azArgv('8423')).toContain('8423')
+  expect(() => azArgv('8423 & calc')).toThrow('invalid work item id')
+  expect(() => azArgv('')).toThrow('invalid work item id')
 })

@@ -5,6 +5,7 @@ import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun } from
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
 import { buildSegments } from './segments'
+import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
 import type { Segment } from './segments'
 import {
   GAP_LIMIT_MS,
@@ -114,6 +115,41 @@ const readHealth = async ($: Engine) => {
   }
 }
 
+// Work item titles: fetched once per work item from Azure DevOps (read-only) and kept in $.store.
+// Fetches run off a timer, never inside a hook chain; attempts are counted per session.
+const titleFetches = new Set<string>()
+const titleAttempts = new Map<string, number>()
+const MAX_TITLE_ATTEMPTS = 2 // the first try plus one retry
+
+const fetchWorkItemTitle = async ($: Engine, id: string) => {
+  const attempts = titleAttempts.get(id) ?? 0
+  if (titleFetches.has(id) || attempts >= MAX_TITLE_ATTEMPTS) return
+  titleFetches.add(id)
+  titleAttempts.set(id, attempts + 1)
+  try {
+    const { exitCode, stdout } = await $.process.run(azArgv(id), { timeoutMs: AZ_TIMEOUT_MS })
+    const title = exitCode === 0 ? parseWorkItemTitle(stdout) : undefined
+    if (title) await $.store.set(titleKey(id), title)
+  } catch {
+    // Not logged in, offline, az missing: silent, nothing cached.
+  } finally {
+    titleFetches.delete(id)
+  }
+}
+
+// The session title for the current work item, or undefined to leave the engine's own. Never awaits az.
+const buildSessionTitle = async ($: Engine): Promise<string | undefined> => {
+  const [current, branchItem] = await Promise.all([read($, run), read($, workItem)])
+  const id = current?.workItem ?? branchItem
+  if (!id) return undefined
+
+  const cached = await $.store.get(titleKey(id))
+  if (typeof cached !== 'string') $.clock.after(0, () => void fetchWorkItemTitle($, id))
+
+  const usage = await $.session.usage().catch(() => undefined)
+  return composeTitle(id, typeof cached === 'string' ? cached : undefined, usage?.context.percent)
+}
+
 // Merges the engine's agent list into the session tally; callers never let a failure reach a turn or tool call.
 // Serialized: a request that arrives while a read is in flight waits for it plus one fresh rerun, so a stale
 // list can never overwrite a newer one.
@@ -184,6 +220,18 @@ export const register: Register = on => {
     await recordActivity($)
     if (e.tool === 'Bash') await refresh($).catch(() => undefined)
     return result
+  }).catch(($, e, next) => next(e))
+
+  on('classic.UserPromptSubmit', async ($, e, next) => {
+    const result = await next(e)
+    const sessionTitle = await buildSessionTitle($).catch(() => undefined)
+    return sessionTitle ? { ...result, sessionTitle } : result
+  }).catch(($, e, next) => next(e))
+
+  on('classic.SessionStart', async ($, e, next) => {
+    const result = await next(e)
+    const sessionTitle = await buildSessionTitle($).catch(() => undefined)
+    return sessionTitle ? { ...result, sessionTitle } : result
   }).catch(($, e, next) => next(e))
 
   on('agent.spawn', async ($, e, next) => {

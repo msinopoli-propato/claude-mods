@@ -1,7 +1,7 @@
 {
   "name": "session-status",
-  "version": "0.5.1",
-  "description": "Colored band above the prompt with work item, git branch, active-time timer, subagent counts, context usage, CPU/RAM/temperature (Windows only)",
+  "version": "0.6.0",
+  "description": "Colored band above the prompt with work item, git branch, active-time timer, subagent counts, context usage, CPU/RAM/temperature (Windows only), plus a session title with the work item title (needs the Azure CLI, read-only)",
   "author": { "name": "msinopoli" },
   "types": "./types/index.d.ts"
 }
