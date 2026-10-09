@@ -14,6 +14,12 @@ type World = {
   healthCalls?: number
   healthArgv?: { argv: readonly string[]; init?: { timeoutMs?: number } }
   healthGate?: Promise<void>
+  // What $.agent.list() answers; `agentsFail` makes the call reject.
+  agents?: { id: string; status: string }[]
+  agentsFail?: boolean
+  agentsGate?: Promise<void>
+  agentListCalls?: number
+  spawnId?: string
 }
 
 const MINUTE = 60_000
@@ -56,6 +62,14 @@ const world = (on: any, w: World = {}) => {
   on('turn.complete', () => ({ text: 'ok' }))
   on('prompt.submit', (_$: unknown, e: { text: string }) => ({ text: e.text }))
   on('tool.call', () => ({ result: 'ok', text: 'ok' }))
+  on('agent.list', async () => {
+    w.agentListCalls = (w.agentListCalls ?? 0) + 1
+    if (w.agentsFail) return { deny: 'agent list unavailable' }
+    const snapshot = w.agents ?? [] // what the engine knew when the call started
+    await w.agentsGate
+    return { value: snapshot.map(a => ({ description: 'task', type: 'general-purpose', ...a })) }
+  })
+  on('agent.spawn', () => ({ model: 'm', agentId: w.spawnId ?? 'spawned-1' }))
   on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'base', scope: 'shared' }] }))
   // The engine's own AbovePrompt: an empty box, drawn when the plugin passes.
   on('ui.render', () => ({ type: 'Box', props: {}, children: [] }))
@@ -210,9 +224,8 @@ test('outside a git repo it shows only the work item, if any, and usage', async 
 test('ignores subagent turns', async ($, on) => {
   world(on, { branch: 'feature/issue-1' })
   await $.turn.complete(turn({ agentId: 'sub-1' }))
-  // Nothing was refreshed: the band has nothing to draw yet.
-  const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-  expect(await ui.findAll({ type: 'Text' })).toHaveLength(0)
+  // Branch, work item and usage were not refreshed, and an id no list or spawn named never enters the tally.
+  expect(await bandText($)).toBe('')
 })
 
 test('yields the band to a survey', async ($, on) => {
@@ -510,4 +523,180 @@ test('the interval stops when the session ends', async ($, on) => {
   await $.session.end({ reason: 'other', sessionId: 's1', resume: {} as never })
   await clock.advance(60_000)
   expect(w.healthCalls).toBe(1)
+})
+
+// ---------------------------------------------------------------- subagents
+
+const bandText = async ($: any, surface: (typeof SURFACES)[number] = 'terminal') =>
+  (await drawBand($, surface)).map(s => s.text).join('')
+
+for (const surface of SURFACES) {
+  test(`subagents segment sits after the timer and before the branch on ${surface}`, async ($, on) => {
+    const w: World = {
+      branch: 'feature/issue-8423',
+      percent: 10,
+      agents: [
+        { id: 'a', status: 'running' },
+        { id: 'b', status: 'waiting' },
+        { id: 'c', status: 'completed' },
+        { id: 'd', status: 'completed' },
+        { id: 'e', status: 'completed' },
+      ],
+    }
+    world(on, w)
+    await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+    await $.turn.complete(turn())
+    const all = await drawBand($, surface)
+    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⏱ 0.0h · 🤖 2 running · 3 done · ⎇ feature/issue-8423 · ctx 10%')
+
+    const [, , running, done] = segmentsOf(all)
+    expect(running).toMatchObject({ color: 'warning', bold: true })
+    expect(done.color).toBe('success')
+  })
+}
+
+test('without a timer the segment follows the work item', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', agents: [{ id: 'a', status: 'running' }] })
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('WI #8423 · 🤖 1 running · 0 done · ⎇ feature/issue-8423')
+})
+
+test('running is dim when nothing runs, and failed shows only when above zero', async ($, on) => {
+  world(on, { branch: 'x', agents: [{ id: 'a', status: 'completed' }] })
+  await $.turn.complete(turn())
+  const all = await drawBand($, 'terminal')
+  expect(all.map(s => s.text).join('')).toBe('🤖 0 running · 1 done · ⎇ x')
+  const [running] = segmentsOf(all)
+  expect(running.dimColor).toBe(true)
+  expect(running.bold).toBe(undefined)
+})
+
+test('failed and killed agents land in the failed bucket', async ($, on) => {
+  world(on, { branch: 'x', agents: [{ id: 'a', status: 'failed' }, { id: 'b', status: 'killed' }, { id: 'c', status: 'completed' }] })
+  await $.turn.complete(turn())
+  const all = await drawBand($, 'terminal')
+  expect(all.map(s => s.text).join('')).toBe('🤖 0 running · 1 done · 2 failed · ⎇ x')
+  expect(segmentsOf(all)[2]).toMatchObject({ text: '2 failed', color: 'error' })
+})
+
+test('idle teammates are neither running nor done', async ($, on) => {
+  const w: World = { branch: 'x', agents: [{ id: 'a', status: 'idle' }] }
+  world(on, w)
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('⎇ x')
+
+  w.agents = [{ id: 'a', status: 'idle' }, { id: 'b', status: 'running' }]
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('🤖 1 running · 0 done · ⎇ x')
+})
+
+test('the tally survives the engine dropping finished agents', async ($, on) => {
+  const w: World = {
+    branch: 'x',
+    agents: [{ id: 'a', status: 'completed' }, { id: 'b', status: 'failed' }, { id: 'c', status: 'running' }],
+  }
+  world(on, w)
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('🤖 1 running · 1 done · 1 failed · ⎇ x')
+
+  w.agents = [] // the engine forgot them all; c vanished while still active, so it counts as done
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('🤖 0 running · 2 done · 1 failed · ⎇ x')
+})
+
+test('a subagent turn marks its own spawned agent by reason', async ($, on) => {
+  const w: World = { branch: 'x', agents: [] }
+  world(on, w)
+  for (const id of ['s1', 's2', 's3']) {
+    w.spawnId = id
+    await $.agent.spawn({ prompt: 'work' })
+  }
+  expect(await bandText($)).toBe('🤖 3 running · 0 done')
+  await $.turn.complete(turn({ agentId: 's1', reason: 'answer' }))
+  await $.turn.complete(turn({ agentId: 's2', reason: 'error' }))
+  await $.turn.complete(turn({ agentId: 's3', reason: 'aborted' }))
+  expect(await bandText($)).toBe('🤖 0 running · 1 done · 2 failed')
+})
+
+test('engine forks (compaction, memory) never enter the tally', async ($, on) => {
+  world(on, { branch: 'x', agents: [] })
+  for (const agentId of ['fork-compact', 'fork-memory']) {
+    await $.turn.complete(turn({ agentId, reason: 'answer' }))
+    await $.turn.complete(turn({ agentId, reason: 'error' }))
+  }
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('⎇ x')
+})
+
+test('a freshly spawned agent absent from the list is not counted done', async ($, on) => {
+  const w: World = { branch: 'x', agents: [] }
+  world(on, w)
+  await $.agent.spawn({ prompt: 'work' })
+  await $.turn.complete(turn()) // the list does not name it yet
+  expect(await bandText($)).toBe('🤖 1 running · 0 done · ⎇ x')
+
+  w.agents = [{ id: 'spawned-1', status: 'running' }] // now seen in the list...
+  await $.turn.complete(turn())
+  w.agents = [] // ...and then the engine drops it while it was still active
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('🤖 0 running · 1 done · ⎇ x')
+})
+
+test('list reads are serialized and the newest one wins', async ($, on) => {
+  let release!: () => void
+  const w: World = {
+    branch: 'x',
+    agents: [{ id: 'a', status: 'running' }],
+    agentsGate: new Promise<void>(resolve => (release = resolve)),
+  }
+  const { clock } = world(on, w)
+  const turns = [$.turn.complete(turn()), $.turn.complete(turn()), $.turn.complete(turn())]
+  await clock.settle()
+  expect(w.agentListCalls).toBe(1) // one read in flight, the others wait
+
+  w.agents = [{ id: 'a', status: 'completed' }] // newer than what the first read captured
+  release()
+  await Promise.all(turns)
+  expect(w.agentListCalls).toBe(2) // exactly one rerun for all the requests that arrived meanwhile
+  expect(await bandText($)).toBe('🤖 0 running · 1 done · ⎇ x')
+})
+
+test('a subagent turn overrides a stale running status in the list', async ($, on) => {
+  world(on, { branch: 'x', agents: [{ id: 's1', status: 'running' }] })
+  await $.turn.complete(turn({ agentId: 's1', reason: 'answer' }))
+  expect(await bandText($)).toBe('🤖 0 running · 1 done')
+})
+
+test('spawning an agent refreshes the tally', async ($, on) => {
+  const w: World = { branch: 'x', agents: [] }
+  world(on, w)
+  w.agents = [{ id: 'spawned-1', status: 'running' }]
+  await $.agent.spawn({ prompt: 'read the readme' })
+  expect(await bandText($)).toBe('🤖 1 running · 0 done')
+})
+
+test('the 20 second tick refreshes the tally', async ($, on) => {
+  const w: World = { branch: 'x', agents: [] }
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(await bandText($)).toBe('⎇ x')
+  w.agents = [{ id: 'a', status: 'running' }]
+  await clock.advance(20_000)
+  expect(await bandText($)).toBe('🤖 1 running · 0 done · ⎇ x')
+})
+
+test('no subagents, no segment; a failing list never breaks a turn', async ($, on) => {
+  const w: World = { branch: 'x', agentsFail: true }
+  world(on, w)
+  const result = await $.turn.complete(turn())
+  expect(result.text).toBe('ok')
+  expect(await bandText($)).toBe('⎇ x')
+})
+
+test('the session ending forgets the tally', async ($, on) => {
+  world(on, { branch: 'x', agents: [{ id: 'a', status: 'completed' }] })
+  await $.turn.complete(turn())
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: {} as never })
+  const w2 = await bandText($)
+  expect(w2.includes('🤖')).toBe(false)
 })

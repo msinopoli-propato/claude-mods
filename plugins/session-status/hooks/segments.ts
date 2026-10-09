@@ -1,6 +1,13 @@
 import type { Color } from 'claude-code'
 
-import type { SessionStatusBranch, SessionStatusContext, SessionStatusHealth, SessionStatusRun } from '../types'
+import type {
+  SessionStatusAgents,
+  SessionStatusBranch,
+  SessionStatusContext,
+  SessionStatusHealth,
+  SessionStatusRun,
+} from '../types'
+import { countAgents } from './agents'
 import { healthColors } from './health'
 import { formatHours } from './timer'
 
@@ -10,6 +17,7 @@ export type BandData = {
   branch: SessionStatusBranch | null
   workItem: string | null
   context: SessionStatusContext | null
+  agents: SessionStatusAgents
   health: SessionStatusHealth | null
   run: SessionStatusRun | null
 }
@@ -37,6 +45,17 @@ export const buildSegments = (data: BandData): Segment[] => {
   else if (data.run) segments.push({ text: 'WI ?', color: 'claude', bold: true })
 
   if (data.run) segments.push({ text: `⏱ ${formatHours(data.run.activeMs)}h`, color: 'permission' })
+
+  const agents = countAgents(data.agents)
+  if (agents.running + agents.done + agents.failed > 0) {
+    segments.push(
+      agents.running > 0
+        ? { text: `🤖 ${agents.running} running`, color: 'warning', bold: true }
+        : { text: '🤖 0 running', dimColor: true },
+    )
+    segments.push({ text: `${agents.done} done`, color: 'success' })
+    if (agents.failed > 0) segments.push({ text: `${agents.failed} failed`, color: 'error' })
+  }
 
   if (data.branch) segments.push(branchSegment(data.branch))
 

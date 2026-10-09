@@ -2,6 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Engine, Register } from 'claude-code'
 
 import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun } from '../types'
+import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
 import { buildSegments } from './segments'
 import type { Segment } from './segments'
@@ -32,6 +33,7 @@ export const findWorkItem = (...candidates: readonly string[]) => {
 const branch = atom({ plugin: 'session-status', key: 'branch' } as const, null)
 const workItem = atom({ plugin: 'session-status', key: 'workItem' } as const, null)
 const context = atom({ plugin: 'session-status', key: 'context' } as const, null)
+const agents = atom({ plugin: 'session-status', key: 'agents' } as const, {})
 const health = atom({ plugin: 'session-status', key: 'health' } as const, null)
 const run = atom({ plugin: 'session-status', key: 'run' } as const, null)
 
@@ -112,6 +114,36 @@ const readHealth = async ($: Engine) => {
   }
 }
 
+// Merges the engine's agent list into the session tally; callers never let a failure reach a turn or tool call.
+// Serialized: a request that arrives while a read is in flight waits for it plus one fresh rerun, so a stale
+// list can never overwrite a newer one.
+let agentSync: Promise<void> | undefined
+let isAgentSyncRequested = false
+
+const syncAgents = ($: Engine): Promise<void> => {
+  if (agentSync) {
+    isAgentSyncRequested = true
+    return agentSync
+  }
+  agentSync = (async () => {
+    try {
+      do {
+        isAgentSyncRequested = false
+        const list = await $.agent.list()
+        await update($, agents, tally => mergeList(tally, list))
+      } while (isAgentSyncRequested)
+    } finally {
+      agentSync = undefined
+    }
+  })()
+  return agentSync
+}
+
+// One timer period: both reads run off the timer, never inside a hook chain.
+const poll = async ($: Engine) => {
+  await Promise.all([readHealth($), syncAgents($).catch(() => undefined)])
+}
+
 export const register: Register = on => {
   let healthTimer: { cancel: () => void } | undefined
 
@@ -121,8 +153,8 @@ export const register: Register = on => {
       .register({ name: 'wi-time', description: 'Show the active time measured for the current prosuite-comandos run' })
       .catch(() => undefined)
     healthTimer?.cancel()
-    healthTimer = $.clock.every(HEALTH_INTERVAL_MS, () => void readHealth($))
-    void readHealth($)
+    healthTimer = $.clock.every(HEALTH_INTERVAL_MS, () => void poll($))
+    void poll($)
     await refresh($).catch(() => undefined)
     return result
   })
@@ -131,6 +163,7 @@ export const register: Register = on => {
     healthTimer?.cancel()
     healthTimer = undefined
     await update($, run, () => null)
+    await update($, agents, () => ({}))
     return next(e)
   })
 
@@ -153,9 +186,22 @@ export const register: Register = on => {
     return result
   }).catch(($, e, next) => next(e))
 
+  on('agent.spawn', async ($, e, next) => {
+    const result = await next(e)
+    // A just-spawned agent may not be listed yet: seed it so it is counted, not yet "seen in the list".
+    const spawned = result.agentId
+    if (spawned) await update($, agents, tally => seedAgent(tally, spawned)).catch(() => undefined)
+    await syncAgents($).catch(() => undefined)
+    return result
+  }).catch(($, e, next) => next(e))
+
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
-    if (e.agentId === undefined) {
+    await syncAgents($).catch(() => undefined)
+    if (e.agentId !== undefined) {
+      const { agentId, reason } = e
+      await update($, agents, tally => markEnded(tally, agentId, reason)).catch(() => undefined)
+    } else {
       await recordActivity($)
       await refresh($).catch(() => undefined)
     }
@@ -187,6 +233,7 @@ export const register: Register = on => {
       branch: await read($, branch),
       workItem: await read($, workItem),
       context: await read($, context),
+      agents: await read($, agents),
       health: await read($, health),
       run: await read($, run),
     })
