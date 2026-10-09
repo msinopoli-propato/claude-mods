@@ -105,6 +105,7 @@ const drawBand = async ($: any, surface: (typeof SURFACES)[number], props: objec
 }
 
 const segmentsOf = (all: Segment[]) => all.filter(s => s.text !== ' · ')
+const named = (all: Segment[], prefix: string) => segmentsOf(all).find(s => s.text.startsWith(prefix))!
 const branchOf = (all: Segment[]) => segmentsOf(all).find(s => s.text.startsWith('⎇'))
 
 const compose = ($: any) =>
@@ -144,8 +145,8 @@ for (const surface of SURFACES) {
       await $.turn.complete(turn())
     }
     const all = await drawBand($, surface)
-    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⏱ 1.3h · ⎇ feature/issue-8423 · ctx 10%')
-    expect(segmentsOf(all)[1]).toMatchObject({ text: '⏱ 1.3h', color: 'permission' })
+    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-8423 · ⏱ 1.3h · ctx 10%')
+    expect(named(all, '⏱')).toMatchObject({ text: '⏱ 1.3h', color: 'permission' })
   })
 }
 
@@ -154,7 +155,7 @@ test('an active run wins over the branch work item and WI is shown once', async 
   await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
   await $.turn.complete(turn())
   const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⏱ 0.0h · ⎇ feature/issue-1111 · ctx 10%')
+  expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-1111 · ⏱ 0.0h · ctx 10%')
 })
 
 test('a run with unknown work item and no branch work item shows WI ?', async ($, on) => {
@@ -162,7 +163,7 @@ test('a run with unknown work item and no branch work item shows WI ?', async ($
   await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' })
   await $.turn.complete(turn())
   const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI ? · ⏱ 0.0h · ⎇ desarrollo')
+  expect(all.map(s => s.text).join('')).toBe('WI ? · ⎇ desarrollo · ⏱ 0.0h')
   expect(segmentsOf(all)[0]).toMatchObject({ color: 'claude', bold: true })
 })
 
@@ -173,7 +174,7 @@ test('a run with unknown work item falls back to the branch work item', async ($
   w.branch = 'feature/issue-77'
   await $.turn.complete(turn())
   const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI #77 · ⏱ 0.0h · ⎇ feature/issue-77')
+  expect(all.map(s => s.text).join('')).toBe('WI #77 · ⎇ feature/issue-77 · ⏱ 0.0h')
 })
 
 test('clean branch is green, protected branches are bold red even when clean', async ($, on) => {
@@ -438,9 +439,9 @@ for (const surface of SURFACES) {
     const all = await drawBand($, surface)
 
     expect(all.map(s => s.text).join('')).toBe(
-      'WI #8423 · ⏱ 0.0h · ⎇ feature/issue-8423 · ctx 42% (84k) · CPU 27% · RAM 75% · 62°C',
+      'WI #8423 · ⎇ feature/issue-8423 · ⏱ 0.0h · ctx 42% (84k) · CPU 27% · RAM 75% · 62°C',
     )
-    const [, , , , cpu, ram, temp] = segmentsOf(all)
+    const [cpu, ram, temp] = ['CPU', 'RAM', '62'].map(prefix => named(all, prefix))
     expect([cpu.color, ram.color, temp.color]).toEqual(['success', 'warning', 'success'])
   })
 }
@@ -448,7 +449,8 @@ for (const surface of SURFACES) {
 test('colors reach the band per metric', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '95|1000|4000|3700' })
   await start($, clock)
-  const [, cpu, ram, temp] = segmentsOf(await drawBand($, 'terminal'))
+  const all = await drawBand($, 'terminal')
+  const [cpu, ram, temp] = ['CPU', 'RAM', '97'].map(prefix => named(all, prefix))
   expect([cpu, ram, temp].map(s => [s.text, s.color])).toEqual([
     ['CPU 95%', 'error'],
     ['RAM 75%', 'warning'],
@@ -531,7 +533,7 @@ const bandText = async ($: any, surface: (typeof SURFACES)[number] = 'terminal')
   (await drawBand($, surface)).map(s => s.text).join('')
 
 for (const surface of SURFACES) {
-  test(`subagents segment sits after the timer and before the branch on ${surface}`, async ($, on) => {
+  test(`subagents segment sits after the timer and before ctx on ${surface}`, async ($, on) => {
     const w: World = {
       branch: 'feature/issue-8423',
       percent: 10,
@@ -547,26 +549,26 @@ for (const surface of SURFACES) {
     await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
     await $.turn.complete(turn())
     const all = await drawBand($, surface)
-    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⏱ 0.0h · 🤖 2 running · 3 done · ⎇ feature/issue-8423 · ctx 10%')
+    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-8423 · ⏱ 0.0h · 🤖 2 running · 3 done · ctx 10%')
 
-    const [, , running, done] = segmentsOf(all)
+    const [running, done] = ['🤖', '3 done'].map(prefix => named(all, prefix))
     expect(running).toMatchObject({ color: 'warning', bold: true })
     expect(done.color).toBe('success')
   })
 }
 
-test('without a timer the segment follows the work item', async ($, on) => {
+test('without a timer the segment follows the branch', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', agents: [{ id: 'a', status: 'running' }] })
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('WI #8423 · 🤖 1 running · 0 done · ⎇ feature/issue-8423')
+  expect(await bandText($)).toBe('WI #8423 · ⎇ feature/issue-8423 · 🤖 1 running · 0 done')
 })
 
 test('running is dim when nothing runs, and failed shows only when above zero', async ($, on) => {
   world(on, { branch: 'x', agents: [{ id: 'a', status: 'completed' }] })
   await $.turn.complete(turn())
   const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('🤖 0 running · 1 done · ⎇ x')
-  const [running] = segmentsOf(all)
+  expect(all.map(s => s.text).join('')).toBe('⎇ x · 🤖 0 running · 1 done')
+  const running = named(all, '🤖')
   expect(running.dimColor).toBe(true)
   expect(running.bold).toBe(undefined)
 })
@@ -575,8 +577,8 @@ test('failed and killed agents land in the failed bucket', async ($, on) => {
   world(on, { branch: 'x', agents: [{ id: 'a', status: 'failed' }, { id: 'b', status: 'killed' }, { id: 'c', status: 'completed' }] })
   await $.turn.complete(turn())
   const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('🤖 0 running · 1 done · 2 failed · ⎇ x')
-  expect(segmentsOf(all)[2]).toMatchObject({ text: '2 failed', color: 'error' })
+  expect(all.map(s => s.text).join('')).toBe('⎇ x · 🤖 0 running · 1 done · 2 failed')
+  expect(named(all, '2 failed')).toMatchObject({ text: '2 failed', color: 'error' })
 })
 
 test('idle teammates are neither running nor done', async ($, on) => {
@@ -587,7 +589,7 @@ test('idle teammates are neither running nor done', async ($, on) => {
 
   w.agents = [{ id: 'a', status: 'idle' }, { id: 'b', status: 'running' }]
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('🤖 1 running · 0 done · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 0 done')
 })
 
 test('the tally survives the engine dropping finished agents', async ($, on) => {
@@ -597,11 +599,11 @@ test('the tally survives the engine dropping finished agents', async ($, on) => 
   }
   world(on, w)
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('🤖 1 running · 1 done · 1 failed · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 1 done · 1 failed')
 
   w.agents = [] // the engine forgot them all; c vanished while still active, so it counts as done
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('🤖 0 running · 2 done · 1 failed · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 0 running · 2 done · 1 failed')
 })
 
 test('a subagent turn marks its own spawned agent by reason', async ($, on) => {
@@ -633,13 +635,13 @@ test('a freshly spawned agent absent from the list is not counted done', async (
   world(on, w)
   await $.agent.spawn({ prompt: 'work' })
   await $.turn.complete(turn()) // the list does not name it yet
-  expect(await bandText($)).toBe('🤖 1 running · 0 done · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 0 done')
 
   w.agents = [{ id: 'spawned-1', status: 'running' }] // now seen in the list...
   await $.turn.complete(turn())
   w.agents = [] // ...and then the engine drops it while it was still active
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('🤖 0 running · 1 done · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 0 running · 1 done')
 })
 
 test('list reads are serialized and the newest one wins', async ($, on) => {
@@ -658,7 +660,7 @@ test('list reads are serialized and the newest one wins', async ($, on) => {
   release()
   await Promise.all(turns)
   expect(w.agentListCalls).toBe(2) // exactly one rerun for all the requests that arrived meanwhile
-  expect(await bandText($)).toBe('🤖 0 running · 1 done · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 0 running · 1 done')
 })
 
 test('a subagent turn overrides a stale running status in the list', async ($, on) => {
@@ -682,7 +684,7 @@ test('the 20 second tick refreshes the tally', async ($, on) => {
   expect(await bandText($)).toBe('⎇ x')
   w.agents = [{ id: 'a', status: 'running' }]
   await clock.advance(20_000)
-  expect(await bandText($)).toBe('🤖 1 running · 0 done · ⎇ x')
+  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 0 done')
 })
 
 test('no subagents, no segment; a failing list never breaks a turn', async ($, on) => {

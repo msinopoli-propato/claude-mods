@@ -44,6 +44,8 @@ export const buildSegments = (data: BandData): Segment[] => {
   if (workItem) segments.push({ text: `WI #${workItem}`, color: 'claude', bold: true })
   else if (data.run) segments.push({ text: 'WI ?', color: 'claude', bold: true })
 
+  if (data.branch) segments.push(branchSegment(data.branch))
+
   if (data.run) segments.push({ text: `⏱ ${formatHours(data.run.activeMs)}h`, color: 'permission' })
 
   const agents = countAgents(data.agents)
@@ -56,8 +58,6 @@ export const buildSegments = (data: BandData): Segment[] => {
     segments.push({ text: `${agents.done} done`, color: 'success' })
     if (agents.failed > 0) segments.push({ text: `${agents.failed} failed`, color: 'error' })
   }
-
-  if (data.branch) segments.push(branchSegment(data.branch))
 
   const percent = data.context?.percent
   if (percent !== null && percent !== undefined) {
