@@ -1,0 +1,17 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "msinopoli" },
+  "description": "Personal Claude Code mods: turn notifications and a colored session status band",
+  "plugins": [
+    {
+      "name": "turn-notify",
+      "source": "./plugins/turn-notify",
+      "description": "Toast and sound when Claude finishes a turn or needs your input"
+    },
+    {
+      "name": "session-status",
+      "source": "./plugins/session-status",
+      "description": "Colored band above the prompt with git branch, work item, model, context usage, CPU/RAM/temperature (Windows only) and a work-item active-time timer"
+    }
+  ]
+}

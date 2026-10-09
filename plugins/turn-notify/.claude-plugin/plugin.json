@@ -1,0 +1,8 @@
+{
+  "name": "turn-notify",
+  "version": "0.1.0",
+  "description": "Toast and sound when Claude finishes a turn or needs your input",
+  "author": {
+    "name": "msinopoli"
+  }
+}
