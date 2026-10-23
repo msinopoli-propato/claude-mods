@@ -1,4 +1,5 @@
 import type { SessionStatusRun } from '../types'
+import { stepFromCommand } from './step'
 
 // Any silence longer than this between two activity events is dead time and counts for nothing.
 export const GAP_LIMIT_MS = 10 * 60 * 1000
@@ -19,8 +20,10 @@ const argsOf = (text: string) => {
 export const workItemFromCommand = (text: string): string | undefined =>
   ARGS_WORK_ITEM.exec(argsOf(text))?.[1]
 
-export const startRun = (workItem: string | undefined, now: number): SessionStatusRun => ({
+// `text` is the prompt that started the run: its command names the work item's step.
+export const startRun = (workItem: string | undefined, now: number, text = ''): SessionStatusRun => ({
   workItem: workItem ?? null,
+  step: stepFromCommand(text),
   startedAt: now,
   lastEventAt: now,
   activeMs: 0,

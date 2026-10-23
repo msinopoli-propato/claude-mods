@@ -1,6 +1,34 @@
-import type { SessionStatusPullRequest, SessionStatusSync } from '../types'
+import type { SessionStatusBlocker, SessionStatusPullRequest, SessionStatusStep, SessionStatusSync } from '../types'
 
-// The hover texts of the sync and PR segments, in one place: user-facing copy, in Spanish, for a git beginner.
+// The hover texts of the step, lock, sync and PR segments, in one place: user-facing copy, in Spanish, for a beginner.
+
+const ROAD = 'El camino es refine → código → review → prueba → merge.'
+
+export const explainStep = ({ word, command }: SessionStatusStep) => {
+  switch (word) {
+    case 'refine':
+      return (
+        `Paso del WI: estás refinando (${command}): se define qué hay que hacer. ${ROAD} ` +
+        'Qué sigue: implementarlo con /prosuite-comandos:work-item-…'
+      )
+    case 'código':
+      return `Paso del WI: estás programando (${command}). ${ROAD} Qué sigue: subir la rama, abrir el PR y pedir la review.`
+    case 'review':
+      return (
+        `Paso del WI: estás en la revisión del PR (${command}). ${ROAD} ` +
+        'Qué sigue: corregir lo que pidan y, con la aprobación, probarlo.'
+      )
+    case 'prueba':
+      return `Paso del WI: estás probándolo en vivo (${command}). ${ROAD} Qué sigue: si anda, completar el PR para mergear.`
+  }
+}
+
+// The first blocker is named, the rest listed.
+export const explainBlocked = ([first, ...rest]: readonly [SessionStatusBlocker, ...SessionStatusBlocker[]]) =>
+  `Bloqueado: este WI depende de #${first.id}${first.title ? ` (${first.title})` : ''}, ` +
+  `que todavía está en ${first.state}. Hasta que esté terminado, lo tuyo puede quedar trabado. ` +
+  `Qué hacer: consultá a quien tiene #${first.id} o avanzá con otra parte.` +
+  (rest.length > 0 ? ` También espera: ${rest.map(({ id }) => `#${id}`).join(', ')}.` : '')
 
 const commits = (n: number) => `${n} commit${n === 1 ? '' : 's'}`
 

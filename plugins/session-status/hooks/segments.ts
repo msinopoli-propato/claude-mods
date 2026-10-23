@@ -1,5 +1,6 @@
 import type {
   SessionStatusAgents,
+  SessionStatusBlocked,
   SessionStatusBranch,
   SessionStatusContext,
   SessionStatusHealth,
@@ -8,7 +9,7 @@ import type {
   SessionStatusSync,
 } from '../types'
 import { countAgents } from './agents'
-import { explainPullRequest, explainSync } from './explain'
+import { explainBlocked, explainPullRequest, explainStep, explainSync } from './explain'
 import { healthRoles } from './health'
 import type { Role } from './palette'
 import { formatHours } from './timer'
@@ -42,6 +43,8 @@ export type BandData = {
   sync: SessionStatusSync | null
   // The last PR read; drawn only while it belongs to the current branch.
   pr: SessionStatusPullRequest | null
+  // The last blocked check; drawn only while it belongs to the current work item.
+  blocked: SessionStatusBlocked | null
 }
 
 const PROTECTED_BRANCHES = new Set(['main', 'master', 'dev', 'desarrollo', 'uat'])
@@ -113,14 +116,33 @@ const agentsSegment = (data: BandData): Segment | undefined => {
   return { ...counts, role: failed > 0 ? 'error' : 'ok' }
 }
 
+// The active run's work item wins over the branch's.
+const currentWorkItem = (data: BandData) => data.run?.workItem ?? data.workItem
+
 const workItemSegment = (data: BandData): Segment | undefined => {
-  // WI is shown once, first: the active run's work item wins over the branch's; `WI ?` only for a run with neither.
-  const workItem = data.run?.workItem ?? data.workItem
+  // WI is shown once, first; `WI ?` only for a run when neither the args nor the branch name one.
+  const workItem = currentWorkItem(data)
   const mark = { icon: '◆', word: 'WI', role: 'workItem', bold: true } as const
   if (!workItem) return data.run ? { ...mark, value: '?' } : undefined
   const hover = describeTitle(data.title ?? undefined, CARD_TITLE_LIMIT)
   return { ...mark, value: `#${workItem}`, ...(hover ? { hover } : {}) }
 }
+
+// A lock checked for another work item says nothing about this one.
+const blockedSegment = (data: BandData): Segment | undefined => {
+  const [first, ...rest] = data.blocked?.by ?? []
+  if (!first || data.blocked?.workItem !== currentWorkItem(data)) return undefined
+  const title = describeTitle(first.title ?? undefined, CARD_TITLE_LIMIT) ?? null
+  return {
+    icon: '🔒',
+    value: `#${first.id}${rest.length > 0 ? ` +${rest.length}` : ''}`,
+    role: 'error',
+    hover: explainBlocked([{ ...first, title }, ...rest]),
+  }
+}
+
+const stepSegment = ({ run }: BandData): Segment | undefined =>
+  run?.step ? { icon: '▶', value: run.step.word, role: 'workItem', hover: explainStep(run.step) } : undefined
 
 const contextSegment = (context: SessionStatusContext | null): Segment | undefined => {
   if (context?.percent === null || context?.percent === undefined) return undefined
@@ -145,9 +167,11 @@ const present = (segments: (Segment | undefined)[]) => segments.filter((s): s is
 export const buildBand = (data: BandData): Band => ({
   work: present([
     workItemSegment(data),
+    blockedSegment(data),
     data.branch ? branchSegment(data.branch) : undefined,
     syncSegment(data),
     prSegment(data),
+    stepSegment(data),
     data.run ? { icon: '⏱', value: `${formatHours(data.run.activeMs)}h`, role: 'timer' } : undefined,
     agentsSegment(data),
   ]),

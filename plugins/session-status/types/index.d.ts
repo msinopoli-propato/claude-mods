@@ -16,6 +16,12 @@ export type SessionStatusAgentStatus = 'pending' | 'running' | 'waiting' | 'idle
  */
 export type SessionStatusAgents = Record<string, { status: SessionStatusAgentStatus; seen: boolean }>
 
+/** Where a work item is on the road refine → código → review → prueba → merge. */
+export type SessionStatusStepWord = 'refine' | 'código' | 'review' | 'prueba'
+
+/** The step a prosuite command puts the work item in, and the command (its name after `/prosuite-comandos:`). */
+export type SessionStatusStep = { word: SessionStatusStepWord; command: string }
+
 /**
  * One measured prosuite-comandos run. `activeMs` only grows by the gaps between
  * consecutive activity events that are at most ten minutes long.
@@ -23,6 +29,8 @@ export type SessionStatusAgents = Record<string, { status: SessionStatusAgentSta
 export type SessionStatusRun = {
   /** Work item number, or null when neither the args nor the branch name one. */
   workItem: string | null
+  /** The step the run's command stands for; null for a command with none. Missing on runs from before 0.11. */
+  step?: SessionStatusStep | null
   /** Epoch ms, as `$.clock.now()` reports it. */
   startedAt: number
   /** Epoch ms of the last activity event of the run. */
@@ -59,6 +67,12 @@ export type SessionStatusPullRequest = {
   reviewers: number
 }
 
+/** A predecessor work item as last read: its state and its title, when it has one. */
+export type SessionStatusBlocker = { id: string; state: string; title: string | null }
+
+/** The predecessors of `workItem` that are not done yet, as of the last successful check. */
+export type SessionStatusBlocked = { workItem: string; by: SessionStatusBlocker[] }
+
 declare module 'claude-code' {
   interface PluginState {
     'session-status': {
@@ -70,6 +84,7 @@ declare module 'claude-code' {
       run: SessionStatusRun | null
       sync: SessionStatusSync | null
       pr: SessionStatusPullRequest | null
+      blocked: SessionStatusBlocked | null
     }
   }
 }
