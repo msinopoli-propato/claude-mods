@@ -218,13 +218,14 @@ test('the context bar has 8 cells, one per 12.5%, clamped', () => {
 })
 
 for (const surface of SURFACES) {
-  test(`band draws work and gauge rows of status dots on ${surface}`, async ($, on) => {
+  test(`band draws work then gauges in one row of status dots on ${surface}`, async ($, on) => {
     world(on, { branch: 'feature/issue-8423', porcelain: ' M a.cs\n', percent: 42, tokens: 84_200 })
     await $.turn.complete(turn())
     const rows = await drawRows($, surface)
 
-    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423*\nctx 42%')
-    const [[wi, branch], [ctx]] = rows as [[Seg, Seg], [Seg]]
+    expect(rows).toHaveLength(1)
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423* | ctx 42%')
+    const [[wi, branch, ctx]] = rows as [[Seg, Seg, Seg]]
     expect(wi).toMatchObject({ role: 'workItem', bold: true, isAlert: false })
     expect(branch).toMatchObject({ role: 'warning', isAlert: true })
     expect(ctx).toMatchObject({ role: 'ok', isAlert: false })
@@ -248,7 +249,7 @@ for (const surface of SURFACES) {
       await $.turn.complete(turn())
     }
     const rows = await drawRows($, surface)
-    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h\nctx 10%')
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h | ctx 10%')
     expect(named(rows, '⏱')).toMatchObject({ label: '⏱ 1.3h', role: 'timer', isAlert: false })
   })
 
@@ -291,7 +292,7 @@ test('a terminal percent gauge draws the text bar in the role color before the p
   world(on, { branch: 'x', percent: 42 })
   await $.turn.complete(turn())
   const tree: any = await (await mountBand($)).drawn()
-  expect(tree.children[1].children[0].children.map(partOf)).toEqual([
+  expect(tree.children[0].children[1].children.map(partOf)).toEqual([
     { text: '●', color: ROLE_COLORS.ok },
     { text: ' ctx ', dimColor: true },
     { text: '▰▰▰▱▱▱▱▱ ', color: ROLE_COLORS.ok },
@@ -317,21 +318,18 @@ test('the terminal draws no Svg', async ($, on) => {
 // ---------------------------------------------------------------- desktop drawing
 
 for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
-  test(`each row is one interactive Svg in a column on ${surface}`, async ($, on) => {
+  test(`the band is one interactive Svg row on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', porcelain: ' M a.cs\n', percent: 42, health: SAMPLE })
     await start($, clock)
     await submit($, '/prosuite-comandos:work-item 8423')
     const tree: any = await (await mountBand($, surface)).drawn()
     expect(tree).toMatchObject({ type: 'Box', props: { flexDirection: 'column' } })
-    expect(tree.children.map((row: any) => row.type)).toEqual(['Svg', 'Svg'])
-    const [work, gauges] = tree.children.map((row: any) => row.props)
-    expect(work.alt).toBe('WI #8423 · ⎇ feature/issue-8423* · ⏱ 0.0h')
-    expect(gauges.alt).toBe('ctx 42% · cpu 27% · ram 75% · temp 62°C')
-    for (const row of [work, gauges]) {
-      expect(row.isInteractive).toBe(true)
-      expect(row.height).toBe(24)
-      expect(row.source.startsWith(`<svg xmlns="http://www.w3.org/2000/svg" width="${row.width}" height="24" viewBox="0 0 ${row.width} 24"`)).toBe(true)
-    }
+    expect(tree.children.map((row: any) => row.type)).toEqual(['Svg'])
+    const [row] = tree.children.map((child: any) => child.props)
+    expect(row.alt).toBe('WI #8423 · ⎇ feature/issue-8423* · ⏱ 0.0h · ctx 42% · cpu 27% · ram 75% · temp 62°C')
+    expect(row.isInteractive).toBe(true)
+    expect(row.height).toBe(24)
+    expect(row.source.startsWith(`<svg xmlns="http://www.w3.org/2000/svg" width="${row.width}" height="24" viewBox="0 0 ${row.width} 24"`)).toBe(true)
   })
 }
 
@@ -464,7 +462,7 @@ test('an active run wins over the branch work item and WI is shown once', async 
   world(on, { branch: 'feature/issue-1111', percent: 10 })
   await submit($, '/prosuite-comandos:work-item 8423')
   await $.turn.complete(turn())
-  expect(textOfRows(await drawRows($))).toBe('◆ #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h\nctx 10%')
+  expect(textOfRows(await drawRows($))).toBe('◆ #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h | ctx 10%')
 })
 
 test('a run with unknown work item and no branch work item shows WI ?', async ($, on) => {
@@ -814,14 +812,14 @@ test('roles follow the thresholds of each metric', () => {
 })
 
 for (const surface of SURFACES) {
-  test(`band draws CPU, RAM and temperature after ctx in the gauge row on ${surface}`, async ($, on) => {
+  test(`band draws CPU, RAM and temperature after ctx on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 42, tokens: 84_200, health: SAMPLE })
     await start($, clock)
     await submit($, '/prosuite-comandos:work-item 8423')
     const rows = await drawRows($, surface)
 
     expect(textOfRows(rows)).toBe(
-      '◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h\nctx 42% | cpu 27% | ram 75% | temp 62°C',
+      '◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | ctx 42% | cpu 27% | ram 75% | temp 62°C',
     )
     const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Seg, Seg, Seg]
     expect([cpu.role, ram.role, temp.role]).toEqual(['ok', 'warning', 'ok'])
@@ -843,7 +841,7 @@ test('colors reach the band per metric', async ($, on) => {
 test('missing temperature leaves CPU and RAM only', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '27|8195448|33177908|' })
   await start($, clock)
-  expect(await bandText($)).toBe('⎇ x\ncpu 27% | ram 75%')
+  expect(await bandText($)).toBe('⎇ x | cpu 27% | ram 75%')
 })
 
 test('a failing or unparsable read omits the health segments', async ($, on) => {
@@ -912,7 +910,7 @@ test('the interval stops when the session ends', async ($, on) => {
 // ---------------------------------------------------------------- subagents
 
 for (const surface of SURFACES) {
-  test(`one agents segment closes the work row, after the timer, on ${surface}`, async ($, on) => {
+  test(`one agents segment comes after the timer, on ${surface}`, async ($, on) => {
     const w: World = {
       branch: 'feature/issue-8423',
       percent: 10,
@@ -928,7 +926,7 @@ for (const surface of SURFACES) {
     await submit($, '/prosuite-comandos:work-item 8423')
     await $.turn.complete(turn())
     const rows = await drawRows($, surface)
-    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓\nctx 10%')
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓ | ctx 10%')
     expect(named(rows, '🤖')).toMatchObject({ role: 'warning', bold: true })
   })
 }
