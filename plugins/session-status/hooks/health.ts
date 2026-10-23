@@ -1,6 +1,5 @@
-import type { Color } from 'claude-code'
-
 import type { SessionStatusHealth } from '../types'
+import type { Role } from './palette'
 
 // One CIM round trip (~3s). Prints `cpu%|freeKB|totalKB|tenthsOfKelvin`; the thermal zone read needs no admin
 // rights, unlike MSAcpi_ThermalZoneTemperature. Passed as one argv element: there is no shell to quote for.
@@ -39,10 +38,10 @@ export const parseHealth = (stdout: string): SessionStatusHealth | null => {
   }
 }
 
-const level = (value: number, warning: number, error: number): Color =>
-  value >= error ? 'error' : value >= warning ? 'warning' : 'success'
+const level = (value: number, warning: number, error: number): Role =>
+  value >= error ? 'error' : value >= warning ? 'warning' : 'ok'
 
-export const healthColors = ({ cpu, ram, tempC }: SessionStatusHealth) => ({
+export const healthRoles = ({ cpu, ram, tempC }: SessionStatusHealth) => ({
   cpu: level(cpu, 70, 90),
   ram: level(ram, 75, 90),
   temp: tempC === null ? undefined : level(tempC, 70, 85),
