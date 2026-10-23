@@ -440,7 +440,7 @@ test('the svg style is Latte by default and Macchiato when dark', () => {
   const style = /<style>(.*)<\/style>/.exec(source)![1]!
   const [light, dark] = style.split('@media (prefers-color-scheme: dark)') as [string, string]
   for (const [css, flavor] of [[light, LATTE], [dark, MACCHIATO]] as const) {
-    expect(css).toContain(`.cap{fill:${flavor.surface}}`)
+    expect(css).toContain(`.cap{fill:${flavor.surface};fill-opacity:0.4}`)
     expect(css).toContain(`.muted{fill:${flavor.overlay}}`)
     expect(css).toContain(`.text{fill:${flavor.text}}`)
     expect(css).toContain(`.r-wi{fill:${flavor.mauve}}`)
