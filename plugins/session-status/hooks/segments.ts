@@ -11,9 +11,18 @@ import type { Role } from './palette'
 import { formatHours } from './timer'
 import { describeTitle } from './title'
 
-// One split pill: a solid icon part and a soft value part, both colored by `role`. `bold` weighs the value;
-// `hover` is the text of a card revealed while the pointer is on it.
-export type Segment = { icon: string; value: string; role: Role; bold?: true; hover?: string }
+// One status dot: an icon (or short label) and a value, colored by `role`. `bold` weighs the value; `percent`
+// makes it a gauge drawn with a bar; `word` spells the icon for a reader that cannot see it; `hover` is the
+// text revealed while the pointer is on it.
+export type Segment = {
+  icon: string
+  value: string
+  role: Role
+  bold?: true
+  percent?: number
+  word?: string
+  hover?: string
+}
 
 // Row one is what is being worked on, row two how the session and the machine are holding up.
 export type Band = { work: Segment[]; gauges: Segment[] }
@@ -63,24 +72,25 @@ const agentsSegment = (data: BandData): Segment | undefined => {
 const workItemSegment = (data: BandData): Segment | undefined => {
   // WI is shown once, first: the active run's work item wins over the branch's; `WI ?` only for a run with neither.
   const workItem = data.run?.workItem ?? data.workItem
-  if (!workItem) return data.run ? { icon: '◆', value: '?', role: 'workItem', bold: true } : undefined
+  const mark = { icon: '◆', word: 'WI', role: 'workItem', bold: true } as const
+  if (!workItem) return data.run ? { ...mark, value: '?' } : undefined
   const hover = describeTitle(data.title ?? undefined, CARD_TITLE_LIMIT)
-  return { icon: '◆', value: `#${workItem}`, role: 'workItem', bold: true, ...(hover ? { hover } : {}) }
+  return { ...mark, value: `#${workItem}`, ...(hover ? { hover } : {}) }
 }
 
 const contextSegment = (context: SessionStatusContext | null): Segment | undefined => {
   if (context?.percent === null || context?.percent === undefined) return undefined
   const { percent, tokens } = context
   const hover = tokens === null ? {} : { hover: `${compact(tokens)} tokens` }
-  return { icon: 'ctx', value: `${contextBar(percent)} ${percent}%`, role: contextRole(percent), ...hover }
+  return { icon: 'ctx', value: `${percent}%`, percent, role: contextRole(percent), ...hover }
 }
 
 const healthSegments = (health: SessionStatusHealth | null): Segment[] => {
   if (!health) return []
   const roles = healthRoles(health)
   const segments: Segment[] = [
-    { icon: 'cpu', value: `${health.cpu}%`, role: roles.cpu },
-    { icon: 'ram', value: `${health.ram}%`, role: roles.ram },
+    { icon: 'cpu', value: `${health.cpu}%`, percent: health.cpu, role: roles.cpu },
+    { icon: 'ram', value: `${health.ram}%`, percent: health.ram, role: roles.ram },
   ]
   if (health.tempC !== null && roles.temp) segments.push({ icon: 'temp', value: `${health.tempC}°C`, role: roles.temp })
   return segments
