@@ -1,6 +1,8 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { parseHealth, healthColors } from './health'
+import { parseHealth, healthRoles } from './health'
+import { MACCHIATO, tint } from './palette'
+import { cellWidth, hoverCardLeft } from './pill'
 import { contextBar } from './segments'
 import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
@@ -113,12 +115,20 @@ const BAND_PROPS = {
 }
 
 const SURFACES = ['terminal', 'desktop'] as const
+type Surface = 'terminal' | 'desktop' | 'vscode' | 'mobile'
 
-// A pill as drawn: its Text's props, its shown text and, for a keyed pill, the hover card beside it.
+const { base, mauve, blue, yellow, red, teal, green } = MACCHIATO
+
+// One drawn Text of a pill: its props and its shown text.
+type Part = { text: string; color?: unknown; backgroundColor?: unknown; bold?: unknown }
+
+// A split pill as drawn: caps (no background), the solid icon part and the soft value part, plus its hover card.
+// `backgroundColor` is the role color (the icon part's), `bold` the value part's.
 type Pill = {
-  text: string
   label: string
-  color?: unknown
+  icon: Part
+  value: Part
+  caps: Part[]
   backgroundColor?: unknown
   bold?: unknown
   hover?: string
@@ -128,20 +138,31 @@ type Pill = {
 const textOf = (node: any): string =>
   typeof node === 'string' ? node : (node?.children ?? []).map(textOf).join('')
 
+const partOf = (node: any): Part => ({ ...node.props, text: textOf(node) })
+
 const pillOf = (node: any): Pill => {
-  if (node.type === 'Text') {
-    const text = textOf(node)
-    return { ...node.props, text, label: text.trim() }
+  const texts: Part[] = node.children.filter((c: any) => c.type === 'Text').map(partOf)
+  const [icon, value] = texts.filter(t => t.backgroundColor !== undefined) as [Part, Part]
+  const caps = texts.filter(t => t.backgroundColor === undefined)
+  const card = node.children.find((c: any) => c.type === 'Box')
+  return {
+    label: `${icon.text.trim()} ${value.text.trim()}`,
+    icon,
+    value,
+    caps,
+    backgroundColor: icon.backgroundColor,
+    bold: value.bold,
+    ...(card ? { hover: textOf(card).trim(), card: { ...card.props, hover: card.hover } } : {}),
   }
-  const [glyph, card] = node.children
-  return { ...pillOf(glyph), hover: textOf(card).trim(), card: { ...card.props, hover: card.hover } }
 }
 
+// Untyped like the drawn tree it reads, so tests index rows freely.
+const rowsOf = (tree: any) => (tree.children ?? []).map((row: any): Pill[] => row.children.map(pillOf))
+
 // The band's rows of pills; the engine's own empty Box (the plugin passed) is no rows.
-const drawRows = async ($: any, surface: (typeof SURFACES)[number] = 'terminal', props: object = BAND_PROPS) => {
+const drawRows = async ($: any, surface: Surface = 'terminal', props: object = BAND_PROPS) => {
   const ui = await $.ui.mount({ plugin: 'session-status', surface, component: 'AbovePrompt', props })
-  const tree: any = await ui.drawn()
-  return (tree.children ?? []).map((row: any): Pill[] => row.children.map(pillOf))
+  return rowsOf(await ui.drawn())
 }
 
 const textOfRows = (rows: Pill[][]) => rows.map(row => row.map(p => p.label).join(' | ')).join('\n')
@@ -184,23 +205,24 @@ for (const surface of SURFACES) {
     await $.turn.complete(turn())
     const rows = await drawRows($, surface)
 
-    expect(textOfRows(rows)).toBe('WI #8423 | ⎇ feature/issue-8423*\nctx ▰▰▰▱▱▱▱▱ 42%')
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423*\nctx ▰▰▰▱▱▱▱▱ 42%')
     const [[wi, branch], [ctx]] = rows
-    expect(wi).toMatchObject({ backgroundColor: 'claude', bold: true })
-    expect(branch.backgroundColor).toBe('warning')
-    expect(ctx.backgroundColor).toBe('success')
+    expect(wi).toMatchObject({ backgroundColor: mauve, bold: true })
+    expect(branch.backgroundColor).toBe(yellow)
+    expect(ctx.backgroundColor).toBe(green)
   })
 
-  test(`every pill is inverse text on its color, padded one space each side, on ${surface}`, async ($, on) => {
+  test(`every pill is a solid icon part and a soft value part, padded, on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 42, health: SAMPLE, agents: [{ id: 'a', status: 'running' }] })
     await start($, clock)
     await submit($, '/prosuite-comandos:work-item 8423')
-    const pills = (await drawRows($, surface)).flat()
-    expect(pills).toHaveLength(8)
-    for (const pill of pills) {
-      expect(pill.color).toBe('inverseText')
-      expect(typeof pill.backgroundColor).toBe('string')
-      expect(pill.text).toBe(` ${pill.label} `)
+    const pills: Pill[] = (await drawRows($, surface)).flat()
+    expect(pills.map(p => p.icon.text.trim())).toEqual(['◆', '⎇', '⏱', '🤖', 'ctx', 'cpu', 'ram', 'temp'])
+    for (const { icon, value, backgroundColor: role } of pills) {
+      expect(icon).toMatchObject({ color: base, backgroundColor: role, bold: true })
+      expect(value).toMatchObject({ color: role, backgroundColor: tint(role as string, base) })
+      expect(icon.text).toBe(` ${icon.text.trim()} `)
+      expect(value.text).toBe(` ${value.text.trim()} `)
     }
   })
 
@@ -212,16 +234,74 @@ for (const surface of SURFACES) {
       await $.turn.complete(turn())
     }
     const rows = await drawRows($, surface)
-    expect(textOfRows(rows)).toBe('WI #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h\nctx ▰▱▱▱▱▱▱▱ 10%')
-    expect(named(rows, '⏱')).toMatchObject({ label: '⏱ 1.3h', backgroundColor: 'permission' })
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h\nctx ▰▱▱▱▱▱▱▱ 10%')
+    expect(named(rows, '⏱')).toMatchObject({ label: '⏱ 1.3h', backgroundColor: teal })
   })
 }
+
+test('round caps close every pill on the terminal, in the role color and its tint', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', percent: 42 })
+  await $.turn.complete(turn())
+  for (const { caps, backgroundColor: role } of (await drawRows($, 'terminal')).flat()) {
+    expect(caps).toEqual([
+      { text: '', color: role },
+      { text: '', color: tint(role as string, base) },
+    ])
+  }
+})
+
+test('other surfaces draw no caps: they may lack the Nerd Font glyphs', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', percent: 42 })
+  await $.turn.complete(turn())
+  for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+    const pills = (await drawRows($, surface)).flat()
+    expect(pills).toHaveLength(3)
+    for (const pill of pills) expect(pill.caps).toEqual([])
+  }
+})
+
+// ---------------------------------------------------------------- palette and widths
+
+test('the palette is Catppuccin Macchiato', () => {
+  expect(MACCHIATO).toEqual({
+    base: '#24273a',
+    text: '#cad3f5',
+    overlay0: '#6e738d',
+    mauve: '#c6a0f6',
+    blue: '#8aadf4',
+    yellow: '#eed49f',
+    red: '#ed8796',
+    teal: '#8bd5ca',
+    green: '#a6da95',
+  })
+})
+
+test('tint mixes a color into the base per channel', () => {
+  expect(tint(red, base)).toBe('#443649')
+  expect(tint(red, base, 0)).toBe(base)
+  expect(tint(red, base, 1)).toBe(red)
+  expect(tint('#FFFFFF', '#000000', 0.5)).toBe('#808080')
+})
+
+test('cell width counts astral characters as two cells', () => {
+  expect(cellWidth('ctx')).toBe(3)
+  expect(cellWidth('🤖')).toBe(2)
+  expect(cellWidth(' 🤖 ')).toBe(4)
+  expect(cellWidth('▰▱ 42%')).toBe(6)
+})
+
+test('a hover card opens past the caps, both parts and the row gap', () => {
+  const segment = { icon: '🤖', value: '1 ▸ 0 ✓', role: 'ok' as const }
+  // cap + ' 🤖 ' + ' 1 ▸ 0 ✓ ' + cap + gap
+  expect(hoverCardLeft(segment, true)).toBe(1 + 4 + 9 + 1 + 1)
+  expect(hoverCardLeft(segment, false)).toBe(4 + 9 + 1)
+})
 
 test('an active run wins over the branch work item and WI is shown once', async ($, on) => {
   world(on, { branch: 'feature/issue-1111', percent: 10 })
   await submit($, '/prosuite-comandos:work-item 8423')
   await $.turn.complete(turn())
-  expect(textOfRows(await drawRows($))).toBe('WI #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h\nctx ▰▱▱▱▱▱▱▱ 10%')
+  expect(textOfRows(await drawRows($))).toBe('◆ #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h\nctx ▰▱▱▱▱▱▱▱ 10%')
 })
 
 test('a run with unknown work item and no branch work item shows WI ?', async ($, on) => {
@@ -229,8 +309,8 @@ test('a run with unknown work item and no branch work item shows WI ?', async ($
   await submit($, '/prosuite-comandos:test-en-vivo')
   await $.turn.complete(turn())
   const rows = await drawRows($)
-  expect(textOfRows(rows)).toBe('WI ? | ⎇ desarrollo | ⏱ 0.0h')
-  expect(rows[0][0]).toMatchObject({ backgroundColor: 'claude', bold: true })
+  expect(textOfRows(rows)).toBe('◆ ? | ⎇ desarrollo | ⏱ 0.0h')
+  expect(rows[0][0]).toMatchObject({ backgroundColor: mauve, bold: true })
 })
 
 test('a run with unknown work item falls back to the branch work item', async ($, on) => {
@@ -239,30 +319,30 @@ test('a run with unknown work item falls back to the branch work item', async ($
   await submit($, '/prosuite-comandos:test-en-vivo') // unknown at start
   w.branch = 'feature/issue-77'
   await $.turn.complete(turn())
-  expect(textOfRows(await drawRows($))).toBe('WI #77 | ⎇ feature/issue-77 | ⏱ 0.0h')
+  expect(textOfRows(await drawRows($))).toBe('◆ #77 | ⎇ feature/issue-77 | ⏱ 0.0h')
 })
 
-test('clean branch is green, protected branches are bold red even when clean', async ($, on) => {
+test('clean branch is blue, protected branches are bold red even when clean', async ($, on) => {
   const w: World = { branch: 'feature/issue-5' }
   world(on, w)
   await $.turn.complete(turn())
-  expect(branchOf(await drawRows($))).toMatchObject({ label: '⎇ feature/issue-5', backgroundColor: 'success' })
+  expect(branchOf(await drawRows($))).toMatchObject({ label: '⎇ feature/issue-5', backgroundColor: blue })
 
   for (const name of ['main', 'master', 'dev', 'desarrollo', 'UAT']) {
     w.branch = name
     await $.turn.complete(turn())
-    expect(branchOf(await drawRows($))).toMatchObject({ label: `⎇ ${name}`, backgroundColor: 'error', bold: true })
+    expect(branchOf(await drawRows($))).toMatchObject({ label: `⎇ ${name}`, backgroundColor: red, bold: true })
   }
 })
 
 test('dirty protected branch stays red and shows the asterisk', async ($, on) => {
   world(on, { branch: 'main', porcelain: ' M a.cs\n' })
   await $.turn.complete(turn())
-  expect(branchOf(await drawRows($, 'desktop'))).toMatchObject({ label: '⎇ main*', backgroundColor: 'error', bold: true })
+  expect(branchOf(await drawRows($, 'desktop'))).toMatchObject({ label: '⎇ main*', backgroundColor: red, bold: true })
 })
 
 test('context color follows the thresholds', async ($, on) => {
-  const cases: [number, string][] = [[0, 'success'], [59, 'success'], [60, 'warning'], [84, 'warning'], [85, 'error'], [100, 'error']]
+  const cases: [number, string][] = [[0, green], [59, green], [60, yellow], [84, yellow], [85, red], [100, red]]
   const w: World = { branch: 'feature/x' }
   world(on, w)
   for (const [percent, color] of cases) {
@@ -276,7 +356,7 @@ test('context color follows the thresholds', async ($, on) => {
 test('reads the work item from a Windows worktree path', async ($, on) => {
   world(on, { branch: 'desarrollo', cwd: 'C:\\Repos\\worktrees\\stock-api-issue-912' })
   await $.turn.complete(turn())
-  expect(textOfRows(await drawRows($))).toBe('WI #912 | ⎇ desarrollo')
+  expect(textOfRows(await drawRows($))).toBe('◆ #912 | ⎇ desarrollo')
 })
 
 test('outside a git repo the empty work row is omitted and only the gauges show', async ($, on) => {
@@ -309,10 +389,10 @@ for (const surface of SURFACES) {
   test(`a cached work item title is a hover card beside the WI pill on ${surface}`, async ($, on) => {
     world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
     await $.turn.complete(turn())
-    const wi = named(await drawRows($, surface), 'WI')
-    expect(wi).toMatchObject({ label: 'WI #8423', backgroundColor: 'claude', hover: 'Licenses endpoint' })
-    // Opens right after the pill and its gap, over the rest of the row.
-    expect(wi.card).toMatchObject({ ...REVEAL, left: ' WI #8423 '.length + 1 })
+    const wi = named(await drawRows($, surface), '◆')
+    expect(wi).toMatchObject({ label: '◆ #8423', backgroundColor: mauve, hover: 'Licenses endpoint' })
+    // Opens right after the pill and its gap, over the rest of the row: cap, ' ◆ ', ' #8423 ', cap, gap.
+    expect(wi.card).toMatchObject({ ...REVEAL, left: surface === 'terminal' ? 1 + 3 + 7 + 1 + 1 : 3 + 7 + 1 })
   })
 
   test(`the token count is a hover card on the ctx pill on ${surface}`, async ($, on) => {
@@ -320,23 +400,23 @@ for (const surface of SURFACES) {
     await $.turn.complete(turn())
     const ctx = named(await drawRows($, surface), 'ctx')
     expect(ctx).toMatchObject({ label: 'ctx ▰▰▰▱▱▱▱▱ 42%', hover: '84k tokens' })
-    expect(ctx.card).toMatchObject({ ...REVEAL, left: ' ctx ▰▰▰▱▱▱▱▱ 42% '.length + 1 })
+    expect(ctx.card).toMatchObject({ ...REVEAL, left: surface === 'terminal' ? 1 + 5 + 14 + 1 + 1 : 5 + 14 + 1 })
   })
 }
 
-test('the card text is inverse on the pill color, padded', async ($, on) => {
+test('the card text is base on the solid role color, padded', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
   await $.turn.complete(turn())
   const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
   const card = await ui.find({ type: 'Text', text: 'Licenses endpoint' })
-  expect(card).toMatchObject({ text: ' Licenses endpoint ', props: { color: 'inverseText', backgroundColor: 'claude' } })
+  expect(card).toMatchObject({ text: ' Licenses endpoint ', props: { color: base, backgroundColor: mauve } })
 })
 
 test('long titles are cut to 60 characters on the card', async ($, on) => {
   const title = 'Connector.Visma - BE Endpoint de listado de licencias con filtros por fecha y estado'
   world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': title } })
   await $.turn.complete(turn())
-  expect(named(await drawRows($), 'WI').hover).toBe(`${title.slice(0, 59)}…`)
+  expect(named(await drawRows($), '◆').hover).toBe(`${title.slice(0, 59)}…`)
 })
 
 test('describeTitle takes a longer limit for the card', () => {
@@ -348,7 +428,7 @@ test('no cached title, no card, and drawing never runs az', async ($, on) => {
   const w: World = { branch: 'feature/issue-8423', azTitle: 'Licenses endpoint' }
   const { clock } = world(on, w)
   await $.turn.complete(turn())
-  expect(named(await drawRows($), 'WI').hover).toBe(undefined)
+  expect(named(await drawRows($), '◆').hover).toBe(undefined)
   await clock.settle()
   expect(w.azCalls).toBe(undefined)
 })
@@ -356,7 +436,7 @@ test('no cached title, no card, and drawing never runs az', async ($, on) => {
 test('the card follows the run work item', async ($, on) => {
   world(on, { branch: 'feature/issue-1111', store: { 'wi-title:1111': 'Branch item', 'wi-title:9001': 'Run item' } })
   await submit($, '/prosuite-comandos:work-item 9001')
-  expect(named(await drawRows($), 'WI').hover).toBe('Run item')
+  expect(named(await drawRows($), '◆').hover).toBe('Run item')
 })
 
 test('unknown tokens leave the ctx pill without a card', async ($, on) => {
@@ -443,7 +523,7 @@ test('unknown work item shows a question mark in the band', async ($, on) => {
   await submit($, '/prosuite-comandos:test-en-vivo')
   await $.turn.complete(turn())
   expect(await wiTime($)).toContain('WI ?')
-  expect(named(await drawRows($), '⏱')).toMatchObject({ label: '⏱ 0.0h', backgroundColor: 'permission' })
+  expect(named(await drawRows($), '⏱')).toMatchObject({ label: '⏱ 0.0h', backgroundColor: teal })
 })
 
 test('hours are rounded down, never up', async ($, on) => {
@@ -549,9 +629,9 @@ test('unparsable output yields no health', () => {
   }
 })
 
-test('colors follow the thresholds of each metric', () => {
-  const colors = (cpu: number, ram: number, tempC: number | null) => healthColors({ cpu, ram, tempC })
-  expect(colors(69, 74, 69)).toEqual({ cpu: 'success', ram: 'success', temp: 'success' })
+test('roles follow the thresholds of each metric', () => {
+  const colors = (cpu: number, ram: number, tempC: number | null) => healthRoles({ cpu, ram, tempC })
+  expect(colors(69, 74, 69)).toEqual({ cpu: 'ok', ram: 'ok', temp: 'ok' })
   expect(colors(70, 75, 70)).toEqual({ cpu: 'warning', ram: 'warning', temp: 'warning' })
   expect(colors(89, 89, 84)).toEqual({ cpu: 'warning', ram: 'warning', temp: 'warning' })
   expect(colors(90, 90, 85)).toEqual({ cpu: 'error', ram: 'error', temp: 'error' })
@@ -565,10 +645,10 @@ for (const surface of SURFACES) {
     const rows = await drawRows($, surface)
 
     expect(textOfRows(rows)).toBe(
-      'WI #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h\nctx ▰▰▰▱▱▱▱▱ 42% | CPU 27% | RAM 75% | 62°C',
+      '◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h\nctx ▰▰▰▱▱▱▱▱ 42% | cpu 27% | ram 75% | temp 62°C',
     )
-    const [cpu, ram, temp] = (['CPU', 'RAM', '62'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
-    expect([cpu.backgroundColor, ram.backgroundColor, temp.backgroundColor]).toEqual(['success', 'warning', 'success'])
+    const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
+    expect([cpu.backgroundColor, ram.backgroundColor, temp.backgroundColor]).toEqual([green, yellow, green])
   })
 }
 
@@ -576,18 +656,18 @@ test('colors reach the band per metric', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '95|1000|4000|3700' })
   await start($, clock)
   const rows = await drawRows($)
-  const [cpu, ram, temp] = (['CPU', 'RAM', '97'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
+  const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
   expect([cpu, ram, temp].map(s => [s.label, s.backgroundColor])).toEqual([
-    ['CPU 95%', 'error'],
-    ['RAM 75%', 'warning'],
-    ['97°C', 'error'],
+    ['cpu 95%', red],
+    ['ram 75%', yellow],
+    ['temp 97°C', red],
   ])
 })
 
 test('missing temperature leaves CPU and RAM only', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '27|8195448|33177908|' })
   await start($, clock)
-  expect(await bandText($)).toBe('⎇ x\nCPU 27% | RAM 75%')
+  expect(await bandText($)).toBe('⎇ x\ncpu 27% | ram 75%')
 })
 
 test('a failing or unparsable read omits the health pills', async ($, on) => {
@@ -607,13 +687,14 @@ test('reads on an interval of 20 seconds and redraws the new value', async ($, o
   const { clock } = world(on, w)
   await start($, clock)
   const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-  expect((await ui.find({ type: 'Text', text: /CPU/ }))?.text.trim()).toBe('CPU 27%')
+  const cpu = async () => named(rowsOf(await ui.drawn()), 'cpu').label
+  expect(await cpu()).toBe('cpu 27%')
 
   w.health = '50|1000|4000|3352'
   await clock.advance(19_000)
-  expect((await ui.find({ type: 'Text', text: /CPU/ }))?.text.trim()).toBe('CPU 27%')
+  expect(await cpu()).toBe('cpu 27%')
   await clock.advance(1_000)
-  expect((await ui.find({ type: 'Text', text: /CPU/ }))?.text.trim()).toBe('CPU 50%')
+  expect(await cpu()).toBe('cpu 50%')
   expect(w.healthCalls).toBe(2)
 })
 
@@ -671,15 +752,15 @@ for (const surface of SURFACES) {
     await submit($, '/prosuite-comandos:work-item 8423')
     await $.turn.complete(turn())
     const rows = await drawRows($, surface)
-    expect(textOfRows(rows)).toBe('WI #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓\nctx ▰▱▱▱▱▱▱▱ 10%')
-    expect(named(rows, '🤖')).toMatchObject({ backgroundColor: 'warning', bold: true })
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓\nctx ▰▱▱▱▱▱▱▱ 10%')
+    expect(named(rows, '🤖')).toMatchObject({ backgroundColor: yellow, bold: true })
   })
 }
 
 test('without a timer the agents pill follows the branch', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', agents: [{ id: 'a', status: 'running' }] })
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('WI #8423 | ⎇ feature/issue-8423 | 🤖 1 ▸ 0 ✓')
+  expect(await bandText($)).toBe('◆ #8423 | ⎇ feature/issue-8423 | 🤖 1 ▸ 0 ✓')
 })
 
 test('nothing running is green, and failed shows only when above zero', async ($, on) => {
@@ -688,7 +769,7 @@ test('nothing running is green, and failed shows only when above zero', async ($
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('⎇ x | 🤖 0 ▸ 1 ✓')
   const agents = named(rows, '🤖')
-  expect(agents.backgroundColor).toBe('success')
+  expect(agents.backgroundColor).toBe(green)
   expect(agents.bold).toBe(undefined)
 })
 
@@ -697,7 +778,7 @@ test('failed and killed agents land in the failed count, red when nothing runs',
   await $.turn.complete(turn())
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('⎇ x | 🤖 0 ▸ 1 ✓ 2 ✗')
-  expect(named(rows, '🤖').backgroundColor).toBe('error')
+  expect(named(rows, '🤖').backgroundColor).toBe(red)
 })
 
 test('running wins the color over failed', async ($, on) => {
@@ -705,7 +786,7 @@ test('running wins the color over failed', async ($, on) => {
   await $.turn.complete(turn())
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('⎇ x | 🤖 1 ▸ 0 ✓ 1 ✗')
-  expect(named(rows, '🤖')).toMatchObject({ backgroundColor: 'warning', bold: true })
+  expect(named(rows, '🤖')).toMatchObject({ backgroundColor: yellow, bold: true })
 })
 
 test('idle teammates are neither running nor done', async ($, on) => {

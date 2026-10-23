@@ -4,6 +4,8 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun } from '../types'
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
+import { MACCHIATO, ROLE_COLORS, tint } from './palette'
+import { CAP_LEFT, CAP_RIGHT, PILL_GAP, hoverCardLeft, pad } from './pill'
 import { buildBand } from './segments'
 import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
 import type { Segment } from './segments'
@@ -305,31 +307,41 @@ export const register: Register = on => {
     if (rows.length === 0) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
+    // Other surfaces may lack the Nerd Font glyphs: there the pill is square.
+    const hasCaps = e.surface === 'terminal'
 
-    // A chip: inverse text on the segment's color, one space of padding each side.
-    const pill = ({ text, color, bold }: Segment) => (
-      <Text color="inverseText" backgroundColor={color} {...(bold ? { bold } : {})}>{` ${text} `}</Text>
-    )
-
-    // A pill with a hover gets a keyed Box (the hover scope) and a hidden absolute card that opens on the same
-    // row, right after the pill and its gap: the band clips what lies outside it, so a card above or below a
-    // one-row band would not show. Painting over the neighbours moves nothing.
-    const drawSegment = (segment: Segment, key: string) => {
-      if (!segment.hover) return pill(segment)
-      return (
-        <Box key={key}>
-          {pill(segment)}
-          <Box position="absolute" top={0} left={segment.text.length + 3} display="none" hover={{ display: 'flex' }}>
-            {pill({ ...segment, text: segment.hover })}
-          </Box>
-        </Box>
-      )
+    // A split pill: round cap, solid icon part, soft value part (the role color over its tint), round cap.
+    const pill = ({ icon, value, role, bold }: Segment) => {
+      const color = ROLE_COLORS[role]
+      const soft = tint(color, MACCHIATO.base)
+      return [
+        ...(hasCaps ? [<Text color={color}>{CAP_LEFT}</Text>] : []),
+        <Text color={MACCHIATO.base} backgroundColor={color} bold>{pad(icon)}</Text>,
+        <Text color={color} backgroundColor={soft} {...(bold ? { bold } : {})}>{pad(value)}</Text>,
+        ...(hasCaps ? [<Text color={soft}>{CAP_RIGHT}</Text>] : []),
+      ]
     }
+
+    // Every pill is a keyed Box (the hover scope). A hover card is hidden and absolute, opening on the same row
+    // right after the pill and its gap: the band clips what lies outside it, so a card above or below a one-row
+    // band would not show. Painting over the neighbours moves nothing.
+    const drawSegment = (segment: Segment, key: string) => (
+      <Box key={key}>
+        {pill(segment)}
+        {segment.hover ? (
+          <Box position="absolute" top={0} left={hoverCardLeft(segment, hasCaps)} display="none" hover={{ display: 'flex' }}>
+            <Text color={MACCHIATO.base} backgroundColor={ROLE_COLORS[segment.role]}>{pad(segment.hover)}</Text>
+          </Box>
+        ) : null}
+      </Box>
+    )
 
     return (
       <Box flexDirection="column">
         {rows.map((row, r) => (
-          <Box gap={1}>{row.map((segment, index) => drawSegment(segment, `pill-${r}-${index}`))}</Box>
+          <Box key={`row-${r}`} gap={PILL_GAP}>
+            {row.map((segment, index) => drawSegment(segment, `pill-${r}-${index}`))}
+          </Box>
         ))}
       </Box>
     )
