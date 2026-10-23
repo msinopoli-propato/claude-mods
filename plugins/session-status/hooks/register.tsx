@@ -308,7 +308,8 @@ export const register: Register = on => {
       health: currentHealth,
       run: currentRun,
     })
-    const rows = [band.work, band.gauges].filter(row => row.length > 0)
+    // One row: the work segments, then the gauges.
+    const rows = [[...band.work, ...band.gauges]].filter(row => row.length > 0)
     if (rows.length === 0) return next(e)
 
     const elements = $.ui.resolve(e)
