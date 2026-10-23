@@ -239,24 +239,18 @@ for (const surface of SURFACES) {
   })
 }
 
-test('round caps close every pill on the terminal, in the role color and its tint', async ($, on) => {
+test('half-disc caps close every pill on every surface, in the role color and its tint', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', percent: 42 })
   await $.turn.complete(turn())
-  for (const { caps, backgroundColor: role } of (await drawRows($, 'terminal')).flat()) {
-    expect(caps).toEqual([
-      { text: '', color: role },
-      { text: '', color: tint(role as string, base) },
-    ])
-  }
-})
-
-test('other surfaces draw no caps: they may lack the Nerd Font glyphs', async ($, on) => {
-  world(on, { branch: 'feature/issue-8423', percent: 42 })
-  await $.turn.complete(turn())
-  for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+  for (const surface of SURFACES) {
     const pills = (await drawRows($, surface)).flat()
     expect(pills).toHaveLength(3)
-    for (const pill of pills) expect(pill.caps).toEqual([])
+    for (const { caps, backgroundColor: role } of pills) {
+      expect(caps).toEqual([
+        { text: '◖', color: role },
+        { text: '◗', color: tint(role as string, base) },
+      ])
+    }
   }
 })
 
@@ -293,8 +287,7 @@ test('cell width counts astral characters as two cells', () => {
 test('a hover card opens past the caps, both parts and the row gap', () => {
   const segment = { icon: '🤖', value: '1 ▸ 0 ✓', role: 'ok' as const }
   // cap + ' 🤖 ' + ' 1 ▸ 0 ✓ ' + cap + gap
-  expect(hoverCardLeft(segment, true)).toBe(1 + 4 + 9 + 1 + 1)
-  expect(hoverCardLeft(segment, false)).toBe(4 + 9 + 1)
+  expect(hoverCardLeft(segment)).toBe(1 + 4 + 9 + 1 + 1)
 })
 
 test('an active run wins over the branch work item and WI is shown once', async ($, on) => {
@@ -392,7 +385,7 @@ for (const surface of SURFACES) {
     const wi = named(await drawRows($, surface), '◆')
     expect(wi).toMatchObject({ label: '◆ #8423', backgroundColor: mauve, hover: 'Licenses endpoint' })
     // Opens right after the pill and its gap, over the rest of the row: cap, ' ◆ ', ' #8423 ', cap, gap.
-    expect(wi.card).toMatchObject({ ...REVEAL, left: surface === 'terminal' ? 1 + 3 + 7 + 1 + 1 : 3 + 7 + 1 })
+    expect(wi.card).toMatchObject({ ...REVEAL, left: 1 + 3 + 7 + 1 + 1 })
   })
 
   test(`the token count is a hover card on the ctx pill on ${surface}`, async ($, on) => {
@@ -400,7 +393,7 @@ for (const surface of SURFACES) {
     await $.turn.complete(turn())
     const ctx = named(await drawRows($, surface), 'ctx')
     expect(ctx).toMatchObject({ label: 'ctx ▰▰▰▱▱▱▱▱ 42%', hover: '84k tokens' })
-    expect(ctx.card).toMatchObject({ ...REVEAL, left: surface === 'terminal' ? 1 + 5 + 14 + 1 + 1 : 5 + 14 + 1 })
+    expect(ctx.card).toMatchObject({ ...REVEAL, left: 1 + 5 + 14 + 1 + 1 })
   })
 }
 

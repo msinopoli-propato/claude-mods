@@ -1,7 +1,7 @@
 {
   "name": "session-status",
-  "version": "0.8.0",
-  "description": "Two rows of Catppuccin Macchiato split pills above the prompt (solid icon, soft value; Nerd Font round caps in the terminal): work item (its Azure DevOps title on hover), git branch, active-time timer and subagent counts, then a context bar (token count on hover) and CPU/RAM/temperature (Windows only); plus a session title with the work item title (needs the Azure CLI, read-only)",
+  "version": "0.8.1",
+  "description": "Two rows of Catppuccin Macchiato split pills above the prompt (solid icon, soft value; half-disc caps on every surface): work item (its Azure DevOps title on hover), git branch, active-time timer and subagent counts, then a context bar (token count on hover) and CPU/RAM/temperature (Windows only); plus a session title with the work item title (needs the Azure CLI, read-only)",
   "author": { "name": "msinopoli" },
   "types": "./types/index.d.ts"
 }

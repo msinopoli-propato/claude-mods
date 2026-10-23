@@ -307,18 +307,15 @@ export const register: Register = on => {
     if (rows.length === 0) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    // Other surfaces may lack the Nerd Font glyphs: there the pill is square.
-    const hasCaps = e.surface === 'terminal'
-
     // A split pill: round cap, solid icon part, soft value part (the role color over its tint), round cap.
     const pill = ({ icon, value, role, bold }: Segment) => {
       const color = ROLE_COLORS[role]
       const soft = tint(color, MACCHIATO.base)
       return [
-        ...(hasCaps ? [<Text color={color}>{CAP_LEFT}</Text>] : []),
+        <Text color={color}>{CAP_LEFT}</Text>,
         <Text color={MACCHIATO.base} backgroundColor={color} bold>{pad(icon)}</Text>,
         <Text color={color} backgroundColor={soft} {...(bold ? { bold } : {})}>{pad(value)}</Text>,
-        ...(hasCaps ? [<Text color={soft}>{CAP_RIGHT}</Text>] : []),
+        <Text color={soft}>{CAP_RIGHT}</Text>,
       ]
     }
 
@@ -329,7 +326,7 @@ export const register: Register = on => {
       <Box key={key}>
         {pill(segment)}
         {segment.hover ? (
-          <Box position="absolute" top={0} left={hoverCardLeft(segment, hasCaps)} display="none" hover={{ display: 'flex' }}>
+          <Box position="absolute" top={0} left={hoverCardLeft(segment)} display="none" hover={{ display: 'flex' }}>
             <Text color={MACCHIATO.base} backgroundColor={ROLE_COLORS[segment.role]}>{pad(segment.hover)}</Text>
           </Box>
         ) : null}
