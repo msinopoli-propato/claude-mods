@@ -1,9 +1,12 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { parseHealth, healthRoles } from './health'
-import { MACCHIATO, tint } from './palette'
-import { cellWidth, hoverCardLeft } from './pill'
+import { LATTE, MACCHIATO, ROLE_COLORS, tint } from './palette'
+import type { Role } from './palette'
 import { contextBar } from './segments'
+import type { Segment } from './segments'
+import { escapeXml, rowAlt, svgRow } from './svg-band'
+import { cardLeft, cellWidth } from './text-band'
 import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
 
@@ -117,58 +120,73 @@ const BAND_PROPS = {
 const SURFACES = ['terminal', 'desktop'] as const
 type Surface = 'terminal' | 'desktop' | 'vscode' | 'mobile'
 
-const { base, mauve, blue, yellow, red, teal, green } = MACCHIATO
-
-// One drawn Text of a pill: its props and its shown text.
-type Part = { text: string; color?: unknown; backgroundColor?: unknown; bold?: unknown }
-
-// A split pill as drawn: caps (no background), the solid icon part and the soft value part, plus its hover card.
-// `backgroundColor` is the role color (the icon part's), `bold` the value part's.
-type Pill = {
-  label: string
-  icon: Part
-  value: Part
-  caps: Part[]
-  backgroundColor?: unknown
-  bold?: unknown
-  hover?: string
-  card?: Record<string, unknown>
-}
+// One drawn segment, read the same way off either surface: `label` is icon and value (the bar left out),
+// `isAlert` says the value takes the role color instead of the text color.
+type Seg = { label: string; role: Role; bold?: unknown; isAlert: boolean; bar?: string; hover?: string; card?: Record<string, unknown> }
 
 const textOf = (node: any): string =>
   typeof node === 'string' ? node : (node?.children ?? []).map(textOf).join('')
 
+// One drawn Text: its props and its shown text.
+type Part = { text: string; color?: unknown; backgroundColor?: unknown; dimColor?: unknown; bold?: unknown }
 const partOf = (node: any): Part => ({ ...node.props, text: textOf(node) })
 
-const pillOf = (node: any): Pill => {
-  const texts: Part[] = node.children.filter((c: any) => c.type === 'Text').map(partOf)
-  const [icon, value] = texts.filter(t => t.backgroundColor !== undefined) as [Part, Part]
-  const caps = texts.filter(t => t.backgroundColor === undefined)
+const ROLE_OF_COLOR = Object.fromEntries(Object.entries(ROLE_COLORS).map(([role, color]) => [color, role])) as Record<string, Role>
+const ROLE_OF_CLASS: Record<string, Role> = { wi: 'workItem', branch: 'branch', timer: 'timer', ok: 'ok', warning: 'warning', error: 'error' }
+
+// Terminal: a keyed Box per segment holding the dot, the dim icon, the bar of a percent gauge and the value,
+// plus its hover card.
+const terminalSeg = (node: any): Seg => {
+  const [dot, icon, ...rest] = node.children.filter((c: any) => c.type === 'Text').map(partOf) as Part[]
+  const value = rest.at(-1)!
+  const bar = rest.length > 1 ? rest[0] : undefined
   const card = node.children.find((c: any) => c.type === 'Box')
   return {
-    label: `${icon.text.trim()} ${value.text.trim()}`,
-    icon,
-    value,
-    caps,
-    backgroundColor: icon.backgroundColor,
+    label: `${icon!.text.trim()} ${value.text}`,
+    role: ROLE_OF_COLOR[dot!.color as string]!,
     bold: value.bold,
+    isAlert: value.color === dot!.color,
+    ...(bar ? { bar: bar.text.trim() } : {}),
     ...(card ? { hover: textOf(card).trim(), card: { ...card.props, hover: card.hover } } : {}),
   }
 }
 
+const unescapeXml = (text: string) =>
+  text.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&')
+
+// Desktop: one <g> per segment in the row's SVG; the bar is read back as its fill width.
+const svgSegs = (source: string): Seg[] =>
+  [...source.matchAll(/<g>(.*?)<\/g>/g)].map(([, group = '']) => {
+    const title = /<title>(.*?)<\/title>/.exec(group)?.[1]
+    const dot = /<circle class="r-(\w+)"/.exec(group)![1]!
+    const [icon, value] = [...group.matchAll(/<text class="([\w-]+)"([^>]*)>(.*?)<\/text>/g)]
+    const fill = /<rect class="r-\w+"[^>]*width="([\d.]+)"/.exec(group)?.[1]
+    const isBar = group.includes('class="track"')
+    return {
+      label: `${unescapeXml(icon![3]!)} ${unescapeXml(value![3]!)}`,
+      role: ROLE_OF_CLASS[dot]!,
+      bold: value![2]!.includes('font-weight="700"') || undefined,
+      isAlert: value![1] === `r-${dot}`,
+      ...(isBar ? { bar: fill ?? '0' } : {}),
+      ...(title === undefined ? {} : { hover: unescapeXml(title) }),
+    }
+  })
+
 // Untyped like the drawn tree it reads, so tests index rows freely.
-const rowsOf = (tree: any) => (tree.children ?? []).map((row: any): Pill[] => row.children.map(pillOf))
+const rowsOf = (tree: any): Seg[][] =>
+  (tree.children ?? []).map((row: any) => (row.type === 'Svg' ? svgSegs(row.props.source) : row.children.map(terminalSeg)))
 
-// The band's rows of pills; the engine's own empty Box (the plugin passed) is no rows.
-const drawRows = async ($: any, surface: Surface = 'terminal', props: object = BAND_PROPS) => {
-  const ui = await $.ui.mount({ plugin: 'session-status', surface, component: 'AbovePrompt', props })
-  return rowsOf(await ui.drawn())
-}
+const mountBand = ($: any, surface: Surface = 'terminal', props: object = BAND_PROPS) =>
+  $.ui.mount({ plugin: 'session-status', surface, component: 'AbovePrompt', props })
 
-const textOfRows = (rows: Pill[][]) => rows.map(row => row.map(p => p.label).join(' | ')).join('\n')
-const named = (rows: Pill[][], prefix: string) => rows.flat().find(p => p.label.startsWith(prefix))!
-const branchOf = (rows: Pill[][]) => rows.flat().find(p => p.label.startsWith('⎇'))
-const bandText = async ($: any, surface: (typeof SURFACES)[number] = 'terminal') => textOfRows(await drawRows($, surface))
+// The band's rows of segments; the engine's own empty Box (the plugin passed) is no rows.
+const drawRows = async ($: any, surface: Surface = 'terminal', props: object = BAND_PROPS) =>
+  rowsOf(await (await mountBand($, surface, props)).drawn())
+
+const textOfRows = (rows: Seg[][]) => rows.map(row => row.map(s => s.label).join(' | ')).join('\n')
+const named = (rows: Seg[][], prefix: string) => rows.flat().find(s => s.label.startsWith(prefix))!
+const branchOf = (rows: Seg[][]) => rows.flat().find(s => s.label.startsWith('⎇'))
+const bandText = async ($: any, surface: Surface = 'terminal') => textOfRows(await drawRows($, surface))
 
 const compose = ($: any) =>
   $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] })
@@ -200,33 +218,29 @@ test('the context bar has 8 cells, one per 12.5%, clamped', () => {
 })
 
 for (const surface of SURFACES) {
-  test(`band draws work and gauge rows of pills on ${surface}`, async ($, on) => {
+  test(`band draws work and gauge rows of status dots on ${surface}`, async ($, on) => {
     world(on, { branch: 'feature/issue-8423', porcelain: ' M a.cs\n', percent: 42, tokens: 84_200 })
     await $.turn.complete(turn())
     const rows = await drawRows($, surface)
 
-    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423*\nctx ▰▰▰▱▱▱▱▱ 42%')
-    const [[wi, branch], [ctx]] = rows
-    expect(wi).toMatchObject({ backgroundColor: mauve, bold: true })
-    expect(branch.backgroundColor).toBe(yellow)
-    expect(ctx.backgroundColor).toBe(green)
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423*\nctx 42%')
+    const [[wi, branch], [ctx]] = rows as [[Seg, Seg], [Seg]]
+    expect(wi).toMatchObject({ role: 'workItem', bold: true, isAlert: false })
+    expect(branch).toMatchObject({ role: 'warning', isAlert: true })
+    expect(ctx).toMatchObject({ role: 'ok', isAlert: false })
   })
 
-  test(`every pill is a solid icon part and a soft value part, padded, on ${surface}`, async ($, on) => {
+  test(`every segment of a full band, in order, on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 42, health: SAMPLE, agents: [{ id: 'a', status: 'running' }] })
     await start($, clock)
     await submit($, '/prosuite-comandos:work-item 8423')
-    const pills: Pill[] = (await drawRows($, surface)).flat()
-    expect(pills.map(p => p.icon.text.trim())).toEqual(['◆', '⎇', '⏱', '🤖', 'ctx', 'cpu', 'ram', 'temp'])
-    for (const { icon, value, backgroundColor: role } of pills) {
-      expect(icon).toMatchObject({ color: base, backgroundColor: role, bold: true })
-      expect(value).toMatchObject({ color: role, backgroundColor: tint(role as string, base) })
-      expect(icon.text).toBe(` ${icon.text.trim()} `)
-      expect(value.text).toBe(` ${value.text.trim()} `)
-    }
+    const segs = (await drawRows($, surface)).flat()
+    expect(segs.map(s => s.label.split(' ')[0])).toEqual(['◆', '⎇', '⏱', '🤖', 'ctx', 'cpu', 'ram', 'temp'])
+    // Percent gauges carry a bar; temperature is text.
+    expect(segs.map(s => s.bar !== undefined)).toEqual([false, false, false, false, true, true, true, false])
   })
 
-  test(`band shows the timer pill on ${surface}`, async ($, on) => {
+  test(`band shows the timer segment on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 10 })
     await submit($, '/prosuite-comandos:work-item 8423')
     for (let i = 0; i < 9; i++) {
@@ -234,48 +248,203 @@ for (const surface of SURFACES) {
       await $.turn.complete(turn())
     }
     const rows = await drawRows($, surface)
-    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h\nctx ▰▱▱▱▱▱▱▱ 10%')
-    expect(named(rows, '⏱')).toMatchObject({ label: '⏱ 1.3h', backgroundColor: teal })
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h\nctx 10%')
+    expect(named(rows, '⏱')).toMatchObject({ label: '⏱ 1.3h', role: 'timer', isAlert: false })
+  })
+
+  test(`only warning and error values take the role color on ${surface}`, async ($, on) => {
+    const { clock } = world(on, { branch: 'main', percent: 70, health: '95|1000|4000|3352' })
+    await start($, clock)
+    const segs = (await drawRows($, surface)).flat()
+    expect(segs.map(s => [s.label.split(' ')[0], s.role, s.isAlert])).toEqual([
+      ['⎇', 'error', true],
+      ['ctx', 'warning', true],
+      ['cpu', 'error', true],
+      ['ram', 'warning', true],
+      ['temp', 'ok', false],
+    ])
   })
 }
 
-test('half-disc caps close every pill on every surface, in the role color and its tint', async ($, on) => {
-  world(on, { branch: 'feature/issue-8423', percent: 42 })
+// ---------------------------------------------------------------- terminal drawing
+
+test('a terminal segment is a role dot, the dim icon and the value, with no background', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', porcelain: ' M a.cs\n' })
   await $.turn.complete(turn())
-  for (const surface of SURFACES) {
-    const pills = (await drawRows($, surface)).flat()
-    expect(pills).toHaveLength(3)
-    for (const { caps, backgroundColor: role } of pills) {
-      expect(caps).toEqual([
-        { text: '◖', color: role },
-        { text: '◗', color: tint(role as string, base) },
-      ])
+  const tree: any = await (await mountBand($)).drawn()
+  const [wi, branch] = tree.children[0].children
+  expect(wi.children.map(partOf)).toEqual([
+    { text: '●', color: ROLE_COLORS.workItem },
+    { text: ' ◆ ', dimColor: true },
+    { text: '#8423', bold: true },
+  ])
+  expect(branch.children.map(partOf)).toEqual([
+    { text: '●', color: ROLE_COLORS.warning },
+    { text: ' ⎇ ', dimColor: true },
+    { text: 'feature/issue-8423*', color: ROLE_COLORS.warning },
+  ])
+  // Segments sit two cells apart in their row.
+  expect(tree.children[0].props).toMatchObject({ gap: 2 })
+})
+
+test('a terminal percent gauge draws the text bar in the role color before the percent', async ($, on) => {
+  world(on, { branch: 'x', percent: 42 })
+  await $.turn.complete(turn())
+  const tree: any = await (await mountBand($)).drawn()
+  expect(tree.children[1].children[0].children.map(partOf)).toEqual([
+    { text: '●', color: ROLE_COLORS.ok },
+    { text: ' ctx ', dimColor: true },
+    { text: '▰▰▰▱▱▱▱▱ ', color: ROLE_COLORS.ok },
+    { text: '42%' },
+  ])
+})
+
+test('no terminal band text has a background color; only hover cards do', async ($, on) => {
+  const { clock } = world(on, { branch: 'main', percent: 90, health: SAMPLE, agents: [{ id: 'a', status: 'running' }] })
+  await start($, clock)
+  const ui = await mountBand($)
+  const texts = await ui.findAll({ type: 'Text' })
+  expect(texts.length).toBeGreaterThan(0)
+  for (const text of texts) expect(text.props.backgroundColor).toBe(undefined)
+})
+
+test('the terminal draws no Svg', async ($, on) => {
+  world(on, { branch: 'x', percent: 42 })
+  await $.turn.complete(turn())
+  expect(await (await mountBand($)).findAll({ type: 'Svg' })).toHaveLength(0)
+})
+
+// ---------------------------------------------------------------- desktop drawing
+
+for (const surface of ['desktop', 'vscode', 'mobile'] as const) {
+  test(`each row is one interactive Svg in a column on ${surface}`, async ($, on) => {
+    const { clock } = world(on, { branch: 'feature/issue-8423', porcelain: ' M a.cs\n', percent: 42, health: SAMPLE })
+    await start($, clock)
+    await submit($, '/prosuite-comandos:work-item 8423')
+    const tree: any = await (await mountBand($, surface)).drawn()
+    expect(tree).toMatchObject({ type: 'Box', props: { flexDirection: 'column' } })
+    expect(tree.children.map((row: any) => row.type)).toEqual(['Svg', 'Svg'])
+    const [work, gauges] = tree.children.map((row: any) => row.props)
+    expect(work.alt).toBe('WI #8423 · ⎇ feature/issue-8423* · ⏱ 0.0h')
+    expect(gauges.alt).toBe('ctx 42% · cpu 27% · ram 75% · temp 62°C')
+    for (const row of [work, gauges]) {
+      expect(row.isInteractive).toBe(true)
+      expect(row.height).toBe(24)
+      expect(row.source.startsWith(`<svg xmlns="http://www.w3.org/2000/svg" width="${row.width}" height="24" viewBox="0 0 ${row.width} 24"`)).toBe(true)
     }
+  })
+}
+
+test('the desktop draws no Text', async ($, on) => {
+  world(on, { branch: 'x', percent: 42, tokens: 1000 })
+  await $.turn.complete(turn())
+  expect(await (await mountBand($, 'desktop')).findAll({ type: 'Text' })).toHaveLength(0)
+})
+
+test('a desktop gauge bar fills its share of 40px, at least 6, none at 0%', async ($, on) => {
+  const w: World = { branch: 'x' }
+  world(on, w)
+  for (const [percent, fill] of [[42, '16.8'], [5, '6'], [100, '40'], [130, '40'], [0, '0']] as const) {
+    w.percent = percent
+    await $.turn.complete(turn())
+    expect([percent, named(await drawRows($, 'desktop'), 'ctx').bar]).toEqual([percent, fill])
   }
 })
 
-// ---------------------------------------------------------------- palette and widths
+// ---------------------------------------------------------------- svg rows
 
-test('the palette is Catppuccin Macchiato', () => {
+const seg = (icon: string, value: string, role: Role, extra: Partial<Segment> = {}): Segment => ({ icon, value, role, ...extra })
+
+test('an svg row is a capsule with a dot, the muted icon and the value per segment', () => {
+  const { source, width, height } = svgRow([seg('⎇', 'main', 'error', { bold: true })])
+  // 10 inset + (12 + 1 cell + 5 + 4 cells + 16 gap) - 16 + 10 inset, at 7.2px a cell
+  expect([width, height]).toEqual([73, 24])
+  expect(source).toContain(`font-family="Consolas, 'Cascadia Mono', ui-monospace, monospace" font-size="12"`)
+  expect(source).toContain('<rect class="cap" x="0" y="1" width="73" height="22" rx="11"/>')
+  expect(source).toContain(
+    '<g><circle class="r-error" cx="13.5" cy="12" r="3.5"/>' +
+      '<text class="muted" x="22" y="12" dominant-baseline="central">⎇</text>' +
+      '<text class="r-error" x="34.2" y="12" font-weight="700" dominant-baseline="central">main</text></g>',
+  )
+  expect(source.endsWith('</svg>')).toBe(true)
+})
+
+test('a plain value is drawn in the text class', () => {
+  const { source } = svgRow([seg('⏱', '1.3h', 'timer')])
+  expect(source).toContain('<circle class="r-timer"')
+  expect(source).toContain('<text class="text" x="34.2" y="12" dominant-baseline="central">1.3h</text>')
+})
+
+test('a percent gauge draws a rounded track and fill before the percent', () => {
+  const { source, width } = svgRow([seg('ctx', '42%', 'ok', { percent: 42 })])
+  expect(width).toBe(127) // 10 + (12 + 3 cells + 5 + 40 + 6 + 3 cells) + 10
+  expect(source).toContain(
+    '<rect class="track" x="48.6" y="9" width="40" height="6" rx="3"/>' +
+      '<rect class="r-ok" x="48.6" y="9" width="16.8" height="6" rx="3"/>' +
+      '<text class="text" x="94.6" y="12" dominant-baseline="central">42%</text>',
+  )
+})
+
+test('svg widths count an emoji as two cells and add up segments with a 16px gap', () => {
+  expect(svgRow([seg('🤖', '1 ▸ 0 ✓', 'warning')]).width).toBe(102) // 10 + 12 + 14.4 + 5 + 50.4 + 10 = 101.8
+  expect(svgRow([seg('⎇', 'main', 'branch'), seg('⏱', '1.3h', 'timer')]).width).toBe(142)
+})
+
+test('the svg style is Latte by default and Macchiato when dark', () => {
+  const { source } = svgRow([seg('⎇', 'main', 'branch')])
+  const style = /<style>(.*)<\/style>/.exec(source)![1]!
+  const [light, dark] = style.split('@media (prefers-color-scheme: dark)') as [string, string]
+  for (const [css, flavor] of [[light, LATTE], [dark, MACCHIATO]] as const) {
+    expect(css).toContain(`.cap{fill:${flavor.surface}}`)
+    expect(css).toContain(`.muted{fill:${flavor.overlay}}`)
+    expect(css).toContain(`.text{fill:${flavor.text}}`)
+    expect(css).toContain(`.r-wi{fill:${flavor.mauve}}`)
+    expect(css).toContain(`.r-branch{fill:${flavor.blue}}`)
+    expect(css).toContain(`.r-timer{fill:${flavor.teal}}`)
+    expect(css).toContain(`.r-ok{fill:${flavor.green}}`)
+    expect(css).toContain(`.r-warning{fill:${flavor.yellow}}`)
+    expect(css).toContain(`.r-error{fill:${flavor.red}}`)
+    expect(css).toContain('.track{fill:')
+  }
+})
+
+test('the palettes are Catppuccin Latte and Macchiato', () => {
+  expect(LATTE).toEqual({
+    base: '#eff1f5', surface: '#dce0e8', text: '#4c4f69', overlay: '#8c8fa1',
+    mauve: '#8839ef', blue: '#1e66f5', teal: '#179299', green: '#40a02b', yellow: '#df8e1d', red: '#d20f39',
+  })
   expect(MACCHIATO).toEqual({
-    base: '#24273a',
-    text: '#cad3f5',
-    overlay0: '#6e738d',
-    mauve: '#c6a0f6',
-    blue: '#8aadf4',
-    yellow: '#eed49f',
-    red: '#ed8796',
-    teal: '#8bd5ca',
-    green: '#a6da95',
+    base: '#24273a', surface: '#363a4f', text: '#cad3f5', overlay: '#8087a2',
+    mauve: '#c6a0f6', blue: '#8aadf4', teal: '#8bd5ca', green: '#a6da95', yellow: '#eed49f', red: '#ed8796',
   })
 })
 
 test('tint mixes a color into the base per channel', () => {
-  expect(tint(red, base)).toBe('#443649')
-  expect(tint(red, base, 0)).toBe(base)
-  expect(tint(red, base, 1)).toBe(red)
+  expect(tint(MACCHIATO.red, MACCHIATO.base, 0.16)).toBe('#443649')
+  expect(tint(MACCHIATO.red, MACCHIATO.base, 0)).toBe(MACCHIATO.base)
+  expect(tint(MACCHIATO.red, MACCHIATO.base, 1)).toBe(MACCHIATO.red)
   expect(tint('#FFFFFF', '#000000', 0.5)).toBe('#808080')
 })
+
+test('every text that reaches the svg is XML-escaped', () => {
+  expect(escapeXml(`a&b<c>d"e'f`)).toBe('a&amp;b&lt;c&gt;d&quot;e&apos;f')
+  const { source } = svgRow([seg('◆', '#1', 'workItem', { hover: '</title><script>x</script>' }), seg('⎇', `a&"b'<i>`, 'branch')])
+  expect(source).not.toContain('<script')
+  expect(source).toContain('<title>&lt;/title&gt;&lt;script&gt;x&lt;/script&gt;</title>')
+  expect(source).toContain('>a&amp;&quot;b&apos;&lt;i&gt;</text>')
+})
+
+test('a segment carries a title only when it has a hover text', () => {
+  expect(svgRow([seg('⎇', 'main', 'branch')]).source).not.toContain('<title>')
+  expect(svgRow([seg('ctx', '42%', 'ok', { percent: 42, hover: '84k tokens' })]).source).toContain('<g><title>84k tokens</title><circle')
+})
+
+test('a row alt is its plain text, the work item spelled WI', () => {
+  expect(rowAlt([seg('◆', '#8423', 'workItem', { word: 'WI' }), seg('⎇', 'main', 'error'), seg('ctx', '42%', 'ok', { percent: 42 })]))
+    .toBe('WI #8423 · ⎇ main · ctx 42%')
+})
+
+// ---------------------------------------------------------------- widths
 
 test('cell width counts astral characters as two cells', () => {
   expect(cellWidth('ctx')).toBe(3)
@@ -284,17 +453,18 @@ test('cell width counts astral characters as two cells', () => {
   expect(cellWidth('▰▱ 42%')).toBe(6)
 })
 
-test('a hover card opens past the caps, both parts and the row gap', () => {
-  const segment = { icon: '🤖', value: '1 ▸ 0 ✓', role: 'ok' as const }
-  // cap + ' 🤖 ' + ' 1 ▸ 0 ✓ ' + cap + gap
-  expect(hoverCardLeft(segment)).toBe(1 + 4 + 9 + 1 + 1)
+test('a terminal hover card opens past the drawn segment and the row gap', () => {
+  // '●' + ' 🤖 ' + '1 ▸ 0 ✓' + gap
+  expect(cardLeft(seg('🤖', '1 ▸ 0 ✓', 'ok'))).toBe(1 + 4 + 7 + 2)
+  // '●' + ' ctx ' + '▰▰▰▱▱▱▱▱ ' + '42%' + gap
+  expect(cardLeft(seg('ctx', '42%', 'ok', { percent: 42 }))).toBe(1 + 5 + 9 + 3 + 2)
 })
 
 test('an active run wins over the branch work item and WI is shown once', async ($, on) => {
   world(on, { branch: 'feature/issue-1111', percent: 10 })
   await submit($, '/prosuite-comandos:work-item 8423')
   await $.turn.complete(turn())
-  expect(textOfRows(await drawRows($))).toBe('◆ #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h\nctx ▰▱▱▱▱▱▱▱ 10%')
+  expect(textOfRows(await drawRows($))).toBe('◆ #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h\nctx 10%')
 })
 
 test('a run with unknown work item and no branch work item shows WI ?', async ($, on) => {
@@ -303,7 +473,7 @@ test('a run with unknown work item and no branch work item shows WI ?', async ($
   await $.turn.complete(turn())
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('◆ ? | ⎇ desarrollo | ⏱ 0.0h')
-  expect(rows[0][0]).toMatchObject({ backgroundColor: mauve, bold: true })
+  expect(rows[0]![0]).toMatchObject({ role: 'workItem', bold: true })
 })
 
 test('a run with unknown work item falls back to the branch work item', async ($, on) => {
@@ -319,30 +489,30 @@ test('clean branch is blue, protected branches are bold red even when clean', as
   const w: World = { branch: 'feature/issue-5' }
   world(on, w)
   await $.turn.complete(turn())
-  expect(branchOf(await drawRows($))).toMatchObject({ label: '⎇ feature/issue-5', backgroundColor: blue })
+  expect(branchOf(await drawRows($))).toMatchObject({ label: '⎇ feature/issue-5', role: 'branch' })
 
   for (const name of ['main', 'master', 'dev', 'desarrollo', 'UAT']) {
     w.branch = name
     await $.turn.complete(turn())
-    expect(branchOf(await drawRows($))).toMatchObject({ label: `⎇ ${name}`, backgroundColor: red, bold: true })
+    expect(branchOf(await drawRows($))).toMatchObject({ label: `⎇ ${name}`, role: 'error', bold: true })
   }
 })
 
 test('dirty protected branch stays red and shows the asterisk', async ($, on) => {
   world(on, { branch: 'main', porcelain: ' M a.cs\n' })
   await $.turn.complete(turn())
-  expect(branchOf(await drawRows($, 'desktop'))).toMatchObject({ label: '⎇ main*', backgroundColor: red, bold: true })
+  expect(branchOf(await drawRows($, 'desktop'))).toMatchObject({ label: '⎇ main*', role: 'error', bold: true })
 })
 
-test('context color follows the thresholds', async ($, on) => {
-  const cases: [number, string][] = [[0, green], [59, green], [60, yellow], [84, yellow], [85, red], [100, red]]
+test('context role follows the thresholds', async ($, on) => {
+  const cases: [number, Role][] = [[0, 'ok'], [59, 'ok'], [60, 'warning'], [84, 'warning'], [85, 'error'], [100, 'error']]
   const w: World = { branch: 'feature/x' }
   world(on, w)
-  for (const [percent, color] of cases) {
+  for (const [percent, role] of cases) {
     w.percent = percent
     await $.turn.complete(turn())
     const ctx = named(await drawRows($), 'ctx')
-    expect([percent, ctx.backgroundColor]).toEqual([percent, color])
+    expect([percent, ctx.role]).toEqual([percent, role])
   }
 })
 
@@ -357,7 +527,7 @@ test('outside a git repo the empty work row is omitted and only the gauges show'
   await $.turn.complete(turn())
   const rows = await drawRows($, 'desktop')
   expect(rows).toHaveLength(1)
-  expect(textOfRows(rows)).toBe('ctx ▱▱▱▱▱▱▱▱ 5%')
+  expect(textOfRows(rows)).toBe('ctx 5%')
 })
 
 test('ignores subagent turns', async ($, on) => {
@@ -370,60 +540,78 @@ test('ignores subagent turns', async ($, on) => {
 test('yields the band to a survey', async ($, on) => {
   world(on, { branch: 'feature/x' })
   await $.turn.complete(turn())
-  const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: { ...BAND_PROPS, hasSurvey: true } })
-  expect(await ui.findAll({ type: 'Text' })).toHaveLength(0)
+  for (const surface of SURFACES) {
+    const ui = await mountBand($, surface, { ...BAND_PROPS, hasSurvey: true })
+    expect(await ui.findAll({ type: 'Text' })).toHaveLength(0)
+    expect(await ui.findAll({ type: 'Svg' })).toHaveLength(0)
+  }
 })
 
-// ---------------------------------------------------------------- hover cards
+// ---------------------------------------------------------------- hover cards and titles
 
 const REVEAL = { position: 'absolute', top: 0, display: 'none', hover: { display: 'flex' } }
 
-for (const surface of SURFACES) {
-  test(`a cached work item title is a hover card beside the WI pill on ${surface}`, async ($, on) => {
-    world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
-    await $.turn.complete(turn())
-    const wi = named(await drawRows($, surface), '◆')
-    expect(wi).toMatchObject({ label: '◆ #8423', backgroundColor: mauve, hover: 'Licenses endpoint' })
-    // Opens right after the pill and its gap, over the rest of the row: cap, ' ◆ ', ' #8423 ', cap, gap.
-    expect(wi.card).toMatchObject({ ...REVEAL, left: 1 + 3 + 7 + 1 + 1 })
-  })
+test('a cached work item title is a hover card beside the WI segment on the terminal', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
+  await $.turn.complete(turn())
+  const wi = named(await drawRows($), '◆')
+  expect(wi).toMatchObject({ label: '◆ #8423', role: 'workItem', hover: 'Licenses endpoint' })
+  // Opens right after the segment and its gap, over the rest of the row: '●', ' ◆ ', '#8423', gap.
+  expect(wi.card).toMatchObject({ ...REVEAL, left: 1 + 3 + 5 + 2 })
+})
 
-  test(`the token count is a hover card on the ctx pill on ${surface}`, async ($, on) => {
-    world(on, { branch: 'x', percent: 42, tokens: 84_200 })
-    await $.turn.complete(turn())
-    const ctx = named(await drawRows($, surface), 'ctx')
-    expect(ctx).toMatchObject({ label: 'ctx ▰▰▰▱▱▱▱▱ 42%', hover: '84k tokens' })
-    expect(ctx.card).toMatchObject({ ...REVEAL, left: 1 + 5 + 14 + 1 + 1 })
-  })
-}
+test('the token count is a hover card on the ctx segment on the terminal', async ($, on) => {
+  world(on, { branch: 'x', percent: 42, tokens: 84_200 })
+  await $.turn.complete(turn())
+  const ctx = named(await drawRows($), 'ctx')
+  expect(ctx).toMatchObject({ label: 'ctx 42%', bar: '▰▰▰▱▱▱▱▱', hover: '84k tokens' })
+  expect(ctx.card).toMatchObject({ ...REVEAL, left: 1 + 5 + 9 + 3 + 2 })
+})
+
+test('on the desktop the title and the token count are svg titles', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', percent: 42, tokens: 84_200, store: { 'wi-title:8423': 'Licenses <endpoint>' } })
+  await $.turn.complete(turn())
+  const rows = await drawRows($, 'desktop')
+  expect(named(rows, '◆').hover).toBe('Licenses <endpoint>')
+  expect(named(rows, 'ctx').hover).toBe('84k tokens')
+  expect(named(rows, '⎇').hover).toBe(undefined)
+})
 
 test('the card text is base on the solid role color, padded', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
   await $.turn.complete(turn())
-  const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  const ui = await mountBand($)
   const card = await ui.find({ type: 'Text', text: 'Licenses endpoint' })
-  expect(card).toMatchObject({ text: ' Licenses endpoint ', props: { color: base, backgroundColor: mauve } })
+  expect(card).toMatchObject({ text: ' Licenses endpoint ', props: { color: MACCHIATO.base, backgroundColor: ROLE_COLORS.workItem } })
 })
 
-test('long titles are cut to 60 characters on the card', async ($, on) => {
-  const title = 'Connector.Visma - BE Endpoint de listado de licencias con filtros por fecha y estado'
-  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': title } })
-  await $.turn.complete(turn())
-  expect(named(await drawRows($), '◆').hover).toBe(`${title.slice(0, 59)}…`)
-})
+for (const surface of SURFACES) {
+  test(`long titles are cut to 60 characters on ${surface}`, async ($, on) => {
+    const title = 'Connector.Visma - BE Endpoint de listado de licencias con filtros por fecha y estado'
+    world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': title } })
+    await $.turn.complete(turn())
+    expect(named(await drawRows($, surface), '◆').hover).toBe(`${title.slice(0, 59)}…`)
+  })
+
+  test(`no cached title, no card or title, and drawing never runs az on ${surface}`, async ($, on) => {
+    const w: World = { branch: 'feature/issue-8423', azTitle: 'Licenses endpoint' }
+    const { clock } = world(on, w)
+    await $.turn.complete(turn())
+    expect(named(await drawRows($, surface), '◆').hover).toBe(undefined)
+    await clock.settle()
+    expect(w.azCalls).toBe(undefined)
+  })
+
+  test(`unknown tokens leave the ctx segment without a card or title on ${surface}`, async ($, on) => {
+    world(on, { branch: 'x', percent: 42 })
+    await $.turn.complete(turn())
+    expect(named(await drawRows($, surface), 'ctx').hover).toBe(undefined)
+  })
+}
 
 test('describeTitle takes a longer limit for the card', () => {
   expect(describeTitle('a'.repeat(60), 60)).toBe('a'.repeat(60))
   expect(describeTitle('a'.repeat(61), 60)).toBe(`${'a'.repeat(59)}…`)
-})
-
-test('no cached title, no card, and drawing never runs az', async ($, on) => {
-  const w: World = { branch: 'feature/issue-8423', azTitle: 'Licenses endpoint' }
-  const { clock } = world(on, w)
-  await $.turn.complete(turn())
-  expect(named(await drawRows($), '◆').hover).toBe(undefined)
-  await clock.settle()
-  expect(w.azCalls).toBe(undefined)
 })
 
 test('the card follows the run work item', async ($, on) => {
@@ -432,11 +620,6 @@ test('the card follows the run work item', async ($, on) => {
   expect(named(await drawRows($), '◆').hover).toBe('Run item')
 })
 
-test('unknown tokens leave the ctx pill without a card', async ($, on) => {
-  world(on, { branch: 'x', percent: 42 })
-  await $.turn.complete(turn())
-  expect(named(await drawRows($), 'ctx').hover).toBe(undefined)
-})
 
 // ---------------------------------------------------------------- timer
 
@@ -516,7 +699,7 @@ test('unknown work item shows a question mark in the band', async ($, on) => {
   await submit($, '/prosuite-comandos:test-en-vivo')
   await $.turn.complete(turn())
   expect(await wiTime($)).toContain('WI ?')
-  expect(named(await drawRows($), '⏱')).toMatchObject({ label: '⏱ 0.0h', backgroundColor: teal })
+  expect(named(await drawRows($), '⏱')).toMatchObject({ label: '⏱ 0.0h', role: 'timer' })
 })
 
 test('hours are rounded down, never up', async ($, on) => {
@@ -536,7 +719,7 @@ test('the session ending closes the run', async ($, on) => {
   expect(await wiTime($)).toBe('No prosuite-comandos run is active.')
 })
 
-test('no run, no timer pill', async ($, on) => {
+test('no run, no timer segment', async ($, on) => {
   world(on, { branch: 'feature/issue-8423' })
   await $.turn.complete(turn())
   expect(named(await drawRows($), '⏱')).toBe(undefined)
@@ -638,10 +821,10 @@ for (const surface of SURFACES) {
     const rows = await drawRows($, surface)
 
     expect(textOfRows(rows)).toBe(
-      '◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h\nctx ▰▰▰▱▱▱▱▱ 42% | cpu 27% | ram 75% | temp 62°C',
+      '◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h\nctx 42% | cpu 27% | ram 75% | temp 62°C',
     )
-    const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
-    expect([cpu.backgroundColor, ram.backgroundColor, temp.backgroundColor]).toEqual([green, yellow, green])
+    const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Seg, Seg, Seg]
+    expect([cpu.role, ram.role, temp.role]).toEqual(['ok', 'warning', 'ok'])
   })
 }
 
@@ -649,11 +832,11 @@ test('colors reach the band per metric', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '95|1000|4000|3700' })
   await start($, clock)
   const rows = await drawRows($)
-  const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
-  expect([cpu, ram, temp].map(s => [s.label, s.backgroundColor])).toEqual([
-    ['cpu 95%', red],
-    ['ram 75%', yellow],
-    ['temp 97°C', red],
+  const [cpu, ram, temp] = (['cpu', 'ram', 'temp'] as const).map(prefix => named(rows, prefix)) as [Seg, Seg, Seg]
+  expect([cpu, ram, temp].map(s => [s.label, s.role])).toEqual([
+    ['cpu 95%', 'error'],
+    ['ram 75%', 'warning'],
+    ['temp 97°C', 'error'],
   ])
 })
 
@@ -663,7 +846,7 @@ test('missing temperature leaves CPU and RAM only', async ($, on) => {
   expect(await bandText($)).toBe('⎇ x\ncpu 27% | ram 75%')
 })
 
-test('a failing or unparsable read omits the health pills', async ($, on) => {
+test('a failing or unparsable read omits the health segments', async ($, on) => {
   const failing = world(on, { branch: 'x' })
   await start($, failing.clock)
   expect(await bandText($)).toBe('⎇ x')
@@ -679,7 +862,7 @@ test('reads on an interval of 20 seconds and redraws the new value', async ($, o
   const w: World = { branch: 'x', health: '27|1000|4000|3352' }
   const { clock } = world(on, w)
   await start($, clock)
-  const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  const ui = await mountBand($)
   const cpu = async () => named(rowsOf(await ui.drawn()), 'cpu').label
   expect(await cpu()).toBe('cpu 27%')
 
@@ -729,7 +912,7 @@ test('the interval stops when the session ends', async ($, on) => {
 // ---------------------------------------------------------------- subagents
 
 for (const surface of SURFACES) {
-  test(`one agents pill closes the work row, after the timer, on ${surface}`, async ($, on) => {
+  test(`one agents segment closes the work row, after the timer, on ${surface}`, async ($, on) => {
     const w: World = {
       branch: 'feature/issue-8423',
       percent: 10,
@@ -745,12 +928,12 @@ for (const surface of SURFACES) {
     await submit($, '/prosuite-comandos:work-item 8423')
     await $.turn.complete(turn())
     const rows = await drawRows($, surface)
-    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓\nctx ▰▱▱▱▱▱▱▱ 10%')
-    expect(named(rows, '🤖')).toMatchObject({ backgroundColor: yellow, bold: true })
+    expect(textOfRows(rows)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓\nctx 10%')
+    expect(named(rows, '🤖')).toMatchObject({ role: 'warning', bold: true })
   })
 }
 
-test('without a timer the agents pill follows the branch', async ($, on) => {
+test('without a timer the agents segment follows the branch', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', agents: [{ id: 'a', status: 'running' }] })
   await $.turn.complete(turn())
   expect(await bandText($)).toBe('◆ #8423 | ⎇ feature/issue-8423 | 🤖 1 ▸ 0 ✓')
@@ -762,7 +945,7 @@ test('nothing running is green, and failed shows only when above zero', async ($
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('⎇ x | 🤖 0 ▸ 1 ✓')
   const agents = named(rows, '🤖')
-  expect(agents.backgroundColor).toBe(green)
+  expect(agents.role).toBe('ok')
   expect(agents.bold).toBe(undefined)
 })
 
@@ -771,7 +954,7 @@ test('failed and killed agents land in the failed count, red when nothing runs',
   await $.turn.complete(turn())
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('⎇ x | 🤖 0 ▸ 1 ✓ 2 ✗')
-  expect(named(rows, '🤖').backgroundColor).toBe(red)
+  expect(named(rows, '🤖').role).toBe('error')
 })
 
 test('running wins the color over failed', async ($, on) => {
@@ -779,7 +962,7 @@ test('running wins the color over failed', async ($, on) => {
   await $.turn.complete(turn())
   const rows = await drawRows($)
   expect(textOfRows(rows)).toBe('⎇ x | 🤖 1 ▸ 0 ✓ 1 ✗')
-  expect(named(rows, '🤖')).toMatchObject({ backgroundColor: yellow, bold: true })
+  expect(named(rows, '🤖')).toMatchObject({ role: 'warning', bold: true })
 })
 
 test('idle teammates are neither running nor done', async ($, on) => {

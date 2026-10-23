@@ -11,7 +11,7 @@
     {
       "name": "session-status",
       "source": "./plugins/session-status",
-      "description": "Two rows of Catppuccin Macchiato split pills above the prompt (solid icon, soft value; half-disc caps on every surface): work item (its Azure DevOps title on hover), git branch, active-time timer and subagent counts, then a context bar (token count on hover) and CPU/RAM/temperature (Windows only); plus a session title with the work item title (needs the Azure CLI, read-only)"
+      "description": "Two rows of status dots above the prompt, in Catppuccin (Latte on light, Macchiato on dark): on desktop each row is one SVG with a rounded capsule, a colored dot per segment and small progress bars; on the terminal, text dots and text bars. Work item (its Azure DevOps title on hover), git branch, active-time timer and subagent counts, then context (token count on hover) and CPU/RAM/temperature (Windows only); plus a session title with the work item title (needs the Azure CLI, read-only)"
     }
   ]
 }

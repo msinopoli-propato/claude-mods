@@ -4,9 +4,10 @@ import type { EngineInterface as Engine, Register } from 'claude-code'
 import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun } from '../types'
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
-import { MACCHIATO, ROLE_COLORS, tint } from './palette'
-import { CAP_LEFT, CAP_RIGHT, PILL_GAP, hoverCardLeft, pad } from './pill'
+import { MACCHIATO, ROLE_COLORS } from './palette'
 import { buildBand } from './segments'
+import { rowAlt, svgRow } from './svg-band'
+import { SEGMENT_GAP, cardLeft, segmentRuns } from './text-band'
 import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
 import type { Segment } from './segments'
 import {
@@ -41,6 +42,10 @@ const health = atom({ plugin: 'session-status', key: 'health' } as const, null)
 const run = atom({ plugin: 'session-status', key: 'run' } as const, null)
 
 const SECTION_ID = 'session-status:wi-time'
+
+// The surfaces whose element table has Svg (the engine's Elements). Not `'Svg' in table`: a handed-out table is
+// completed with every element name, a missing one drawing as a fragment, so the terminal's Svg draws nothing.
+const SVG_SURFACES: ReadonlySet<string> = new Set(['desktop', 'vscode', 'mobile'])
 
 const git = async ($: Engine, args: readonly string[]) => {
   const { exitCode, stdout } = await $.process.run(['git', ...args], { timeoutMs: 5000 })
@@ -306,38 +311,50 @@ export const register: Register = on => {
     const rows = [band.work, band.gauges].filter(row => row.length > 0)
     if (rows.length === 0) return next(e)
 
-    const { Box, Text } = $.ui.resolve(e)
-    // A split pill: round cap, solid icon part, soft value part (the role color over its tint), round cap.
-    const pill = ({ icon, value, role, bold }: Segment) => {
-      const color = ROLE_COLORS[role]
-      const soft = tint(color, MACCHIATO.base)
-      return [
-        <Text color={color}>{CAP_LEFT}</Text>,
-        <Text color={MACCHIATO.base} backgroundColor={color} bold>{pad(icon)}</Text>,
-        <Text color={color} backgroundColor={soft} {...(bold ? { bold } : {})}>{pad(value)}</Text>,
-        <Text color={soft}>{CAP_RIGHT}</Text>,
-      ]
+    const elements = $.ui.resolve(e)
+    const { Box, Text } = elements
+
+    // Desktop, editor and mobile: one SVG per row, rounded and themed by the frame; its <title>s are the hovers.
+    if (SVG_SURFACES.has(e.surface) && 'Svg' in elements) {
+      const { Svg } = elements
+      return (
+        <Box flexDirection="column">
+          {rows.map((row, r) => {
+            const { source, width, height } = svgRow(row)
+            return <Svg key={`row-${r}`} source={source} alt={rowAlt(row)} width={width} height={height} isInteractive />
+          })}
+        </Box>
+      )
     }
 
-    // Every pill is a keyed Box (the hover scope). A hover card is hidden and absolute, opening on the same row
-    // right after the pill and its gap: the band clips what lies outside it, so a card above or below a one-row
-    // band would not show. Painting over the neighbours moves nothing.
-    const drawSegment = (segment: Segment, key: string) => (
-      <Box key={key}>
-        {pill(segment)}
-        {segment.hover ? (
-          <Box position="absolute" top={0} left={hoverCardLeft(segment)} display="none" hover={{ display: 'flex' }}>
-            <Text color={MACCHIATO.base} backgroundColor={ROLE_COLORS[segment.role]}>{pad(segment.hover)}</Text>
-          </Box>
-        ) : null}
-      </Box>
-    )
+    // The terminal: the same dots as text. Role colors stay Macchiato (no theme key has these hues); the icon
+    // and a plain value use the terminal's own dim and text colors, so they follow its light or dark theme.
+    const drawSegment = (segment: Segment, key: string) => {
+      const color = ROLE_COLORS[segment.role]
+      const runs = segmentRuns(segment)
+      const isAlert = segment.role === 'warning' || segment.role === 'error'
+      // Every segment is a keyed Box (the hover scope). A hover card is hidden and absolute, opening on the same
+      // row right after the segment and its gap: the band clips what lies outside it. Painting over moves nothing.
+      return (
+        <Box key={key}>
+          <Text color={color}>{runs.dot}</Text>
+          <Text dimColor>{runs.icon}</Text>
+          {runs.bar ? <Text color={color}>{runs.bar}</Text> : null}
+          <Text {...(isAlert ? { color } : {})} {...(segment.bold ? { bold: true } : {})}>{runs.value}</Text>
+          {segment.hover ? (
+            <Box position="absolute" top={0} left={cardLeft(segment)} display="none" hover={{ display: 'flex' }}>
+              <Text color={MACCHIATO.base} backgroundColor={color}>{` ${segment.hover} `}</Text>
+            </Box>
+          ) : null}
+        </Box>
+      )
+    }
 
     return (
       <Box flexDirection="column">
         {rows.map((row, r) => (
-          <Box key={`row-${r}`} gap={PILL_GAP}>
-            {row.map((segment, index) => drawSegment(segment, `pill-${r}-${index}`))}
+          <Box key={`row-${r}`} gap={SEGMENT_GAP}>
+            {row.map((segment, index) => drawSegment(segment, `seg-${r}-${index}`))}
           </Box>
         ))}
       </Box>
