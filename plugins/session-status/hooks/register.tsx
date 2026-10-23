@@ -5,12 +5,13 @@ import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun, Sessi
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
 import { MACCHIATO, ROLE_COLORS } from './palette'
-import { PR_INTERVAL_MS, PR_TIMEOUT_MS, TRUSTED_CWD, parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
+import { PR_INTERVAL_MS, PR_TIMEOUT_MS, parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
 import { buildBand } from './segments'
 import { rowAlt, svgRow } from './svg-band'
 import { SYNC_ARGS, parseSync } from './sync'
 import { SEGMENT_GAP, cardLeft, segmentRuns } from './text-band'
 import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
+import { TRUSTED_CWD } from './trusted'
 import type { Segment } from './segments'
 import {
   GAP_LIMIT_MS,
@@ -53,15 +54,19 @@ const SVG_SURFACES: ReadonlySet<string> = new Set(['desktop', 'vscode', 'mobile'
 
 const GIT_TIMEOUT_MS = 5000
 
-const git = async ($: Engine, args: readonly string[]) => {
-  const { exitCode, stdout } = await $.process.run(['git', ...args], { timeoutMs: GIT_TIMEOUT_MS })
+// The repo goes in as `-C`, a plain argument: no shell is involved.
+const runGit = ($: Engine, repo: string, args: readonly string[]) =>
+  $.process.run(['git', '-C', repo, ...args], { cwd: TRUSTED_CWD, timeoutMs: GIT_TIMEOUT_MS })
+
+const git = async ($: Engine, repo: string, args: readonly string[]) => {
+  const { exitCode, stdout } = await runGit($, repo, args)
   return exitCode === 0 ? stdout.trim() : undefined
 }
 
-const readBranch = async ($: Engine): Promise<SessionStatusBranch | undefined> => {
-  const name = await git($, ['rev-parse', '--abbrev-ref', 'HEAD'])
+const readBranch = async ($: Engine, cwd: string): Promise<SessionStatusBranch | undefined> => {
+  const name = await git($, cwd, ['rev-parse', '--abbrev-ref', 'HEAD'])
   if (!name) return undefined
-  const changes = await git($, ['status', '--porcelain'])
+  const changes = await git($, cwd, ['status', '--porcelain'])
   return { name, isDirty: Boolean(changes) }
 }
 
@@ -70,7 +75,7 @@ const readBranch = async ($: Engine): Promise<SessionStatusBranch | undefined> =
 const readSync = async ($: Engine, name: string, cwd: string): Promise<SessionStatusSync | null> => {
   if (name === 'HEAD') return null
   try {
-    const { exitCode, stdout } = await $.process.run(['git', ...SYNC_ARGS], { cwd, timeoutMs: GIT_TIMEOUT_MS })
+    const { exitCode, stdout } = await runGit($, cwd, SYNC_ARGS)
     return exitCode === 0 ? (parseSync(stdout) ?? null) : 'local'
   } catch {
     return null
@@ -81,11 +86,8 @@ const detectWorkItem = (name: string | undefined, cwd: string) =>
   findWorkItem(name ?? '', cwd.replaceAll('\\', '/'))
 
 const refresh = async ($: Engine) => {
-  const [current, cwd, usage] = await Promise.all([
-    readBranch($).catch(() => undefined),
-    $.session.cwd(),
-    $.session.usage(),
-  ])
+  const cwd = await $.session.cwd()
+  const [current, usage] = await Promise.all([readBranch($, cwd).catch(() => undefined), $.session.usage()])
 
   const { percent, tokens } = usage.context
   const ctx: SessionStatusContext | null =
@@ -110,7 +112,8 @@ const resolveRunWorkItem = async ($: Engine, text: string) => {
   const fromArgs = workItemFromCommand(text)
   if (fromArgs) return fromArgs
   try {
-    const [current, cwd] = await Promise.all([readBranch($).catch(() => undefined), $.session.cwd()])
+    const cwd = await $.session.cwd()
+    const current = await readBranch($, cwd).catch(() => undefined)
     return detectWorkItem(current?.name, cwd)
   } catch {
     return undefined
@@ -137,7 +140,7 @@ const readHealth = async ($: Engine) => {
   if (isReadingHealth) return
   isReadingHealth = true
   try {
-    const { exitCode, stdout } = await $.process.run(HEALTH_ARGV, { timeoutMs: HEALTH_TIMEOUT_MS })
+    const { exitCode, stdout } = await $.process.run(HEALTH_ARGV, { cwd: TRUSTED_CWD, timeoutMs: HEALTH_TIMEOUT_MS })
     const sample = exitCode === 0 ? parseHealth(stdout) : null
     await update($, health, () => sample)
   } catch {
@@ -159,7 +162,7 @@ const fetchWorkItemTitle = async ($: Engine, id: string) => {
   titleFetches.add(id)
   titleAttempts.set(id, attempts + 1)
   try {
-    const { exitCode, stdout } = await $.process.run(azArgv(id), { timeoutMs: AZ_TIMEOUT_MS })
+    const { exitCode, stdout } = await $.process.run(azArgv(id), { cwd: TRUSTED_CWD, timeoutMs: AZ_TIMEOUT_MS })
     const title = exitCode === 0 ? parseWorkItemTitle(stdout) : undefined
     if (title) await $.store.set(titleKey(id), title)
   } catch {
@@ -207,7 +210,7 @@ async function readPullRequest($: Engine) {
 
     const cwd = await $.session.cwd()
     // Only Azure DevOps repos have a PR to show; GitHub and the rest show no segment.
-    const remote = await $.process.run(['git', 'remote', 'get-url', 'origin'], { cwd, timeoutMs: GIT_TIMEOUT_MS })
+    const remote = await runGit($, cwd, ['remote', 'get-url', 'origin'])
     const repo = remote.exitCode === 0 ? parseAzureRemote(remote.stdout) : undefined
     const argv = repo && prArgv({ ...repo, branch: name })
     if (!argv) return

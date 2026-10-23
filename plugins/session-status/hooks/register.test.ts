@@ -9,8 +9,9 @@ import { escapeXml, rowAlt, svgRow } from './svg-band'
 import { cardLeft, cellWidth } from './text-band'
 import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
-import { TRUSTED_CWD, parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
+import { parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
 import { parseSync } from './sync'
+import { TRUSTED_CWD } from './trusted'
 
 type World = {
   branch?: string
@@ -905,7 +906,7 @@ test('the read is a PowerShell argv with a 10 second timeout', async ($, on) => 
   await start($, clock)
   expect(w.healthArgv?.argv.slice(0, 4)).toEqual(['powershell', '-NoProfile', '-NonInteractive', '-Command'])
   expect(w.healthArgv?.argv).toHaveLength(5)
-  expect(w.healthArgv?.init?.timeoutMs).toBe(10_000)
+  expect(w.healthArgv?.init).toEqual({ cwd: TRUSTED_CWD, timeoutMs: 10_000 })
 })
 
 test('never starts a read while another is in flight', async ($, on) => {
@@ -1169,7 +1170,7 @@ test('the az call is a cmd /d /s /c argv with a 15 second timeout', async ($, on
     'cmd', '/d', '/s', '/c', 'az', 'boards', 'work-item', 'show', '--id', '8423',
     '--organization', 'https://dev.azure.com/propato', '--query', 'fields', '-o', 'json',
   ])
-  expect(w.azArgv?.init?.timeoutMs).toBe(15_000)
+  expect(w.azArgv?.init).toEqual({ cwd: TRUSTED_CWD, timeoutMs: 15_000 })
 })
 
 test('a cached title is used and az never runs', async ($, on) => {
@@ -1308,14 +1309,14 @@ for (const surface of SURFACES) {
   }
 }
 
-test('the sync read is rev-list against the upstream in the session cwd, never a fetch', async ($, on) => {
+test('the sync read is rev-list against the upstream of the session repo, never a fetch', async ($, on) => {
   const w: World = { branch: 'feature/issue-8423', revList: '0\t0', cwd: 'C:\\Repos\\api' }
   world(on, w)
   await $.turn.complete(turn())
   const seen = w.gitCalls ?? []
   const revList = seen.find(e => e.argv.includes('rev-list'))
-  expect(revList?.argv).toEqual(['git', 'rev-list', '--left-right', '--count', '@{upstream}...HEAD'])
-  expect(revList?.init?.cwd).toBe('C:\\Repos\\api')
+  expect(revList?.argv).toEqual(['git', '-C', 'C:\\Repos\\api', 'rev-list', '--left-right', '--count', '@{upstream}...HEAD'])
+  expect(revList?.init?.cwd).toBe(TRUSTED_CWD)
   expect(seen.some(e => e.argv.includes('fetch'))).toBe(false)
 })
 
@@ -1387,7 +1388,7 @@ test('the az argv targets the repo and branch explicitly, without --detect', () 
 
 test('a value outside its whitelist never reaches the cmd argv', () => {
   expect(prArgv({ ...APP, branch: BRANCH })).toBeDefined()
-  for (const bad of ['a&b', 'a|b', 'a^b', '%PATH%', 'a"b', 'a<b', 'a>b', 'a\nb', '..', 'a/../b', '']) {
+  for (const bad of ['a&b', 'a|b', 'a^b', '%PATH%', 'a"b', 'a<b', 'a>b', 'a\nb', '..', 'a/../b', '', '-o', '--help', '- x']) {
     expect(prArgv({ ...APP, branch: bad })).toBe(undefined)
     expect(prArgv({ ...APP, branch: BRANCH, org: bad })).toBe(undefined)
     expect(prArgv({ ...APP, branch: BRANCH, project: bad })).toBe(undefined)
@@ -1505,7 +1506,7 @@ for (const surface of SURFACES) {
   }
 }
 
-test('az runs in the trusted cwd while the remote is read in the session cwd', async ($, on) => {
+test('az runs in the trusted cwd while the remote is read from the session repo', async ($, on) => {
   const w: World = { branch: BRANCH, remote: 'https://me:s3cr3t@dev.azure.com/propato/Software%20Factory/_git/app', prs: [], cwd: 'C:\\Repos\\api' }
   const { clock } = world(on, w)
   await $.turn.complete(turn())
@@ -1515,12 +1516,28 @@ test('az runs in the trusted cwd while the remote is read in the session cwd', a
   expect(w.prArgv?.argv.some(arg => arg.includes('s3cr3t') || arg.includes('me:'))).toBe(false)
   expect(TRUSTED_CWD).toBe('C:\\Windows\\System32')
   expect(w.prArgv?.init).toEqual({ cwd: TRUSTED_CWD, timeoutMs: 20_000 })
-  expect(w.gitCalls?.find(c => c.argv.includes('remote'))?.init?.cwd).toBe('C:\\Repos\\api')
+  expect(w.gitCalls?.find(c => c.argv.includes('remote'))?.argv.slice(0, 3)).toEqual(['git', '-C', 'C:\\Repos\\api'])
+})
+
+// A repo checkout may plant git.exe or git.cmd at its root, so git never runs with it as the cwd.
+test('every git call runs in the trusted cwd and names the session repo with -C', async ($, on) => {
+  const w: World = { branch: BRANCH, porcelain: ' M a.cs\n', revList: '0\t1', remote: AZURE, prs: [], cwd: 'C:\\Repos\\api' }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  await clock.settle()
+  const calls = w.gitCalls ?? []
+  for (const verb of ['rev-parse', 'status', 'rev-list', 'remote']) expect(calls.some(c => c.argv.includes(verb))).toBe(true)
+  for (const call of calls) {
+    expect(call.argv.slice(0, 3)).toEqual(['git', '-C', 'C:\\Repos\\api'])
+    expect(call.init?.cwd).toBe(TRUSTED_CWD)
+  }
 })
 
 for (const [why, facts] of [
   ['a hostile branch', { branch: 'feature/a&calc', remote: AZURE }],
   ['a hostile remote', { branch: BRANCH, remote: 'https://dev.azure.com/a%26calc/p/_git/app' }],
+  ['an option-like branch', { branch: '--help', remote: AZURE }],
+  ['an option-like repo', { branch: BRANCH, remote: 'https://dev.azure.com/propato/p/_git/-o' }],
 ] as const) {
   test(`${why} shows no PR segment and never runs az`, async ($, on) => {
     const w: World = { ...facts, prs: [pr(41)] }

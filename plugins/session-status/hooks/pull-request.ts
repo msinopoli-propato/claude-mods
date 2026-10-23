@@ -3,9 +3,6 @@ import type { SessionStatusPullRequest } from '../types'
 export const PR_TIMEOUT_MS = 20_000
 export const PR_INTERVAL_MS = 120_000
 
-// cmd and process lookup resolve a bare `cmd`/`az` in the cwd before PATH: a repo checkout must never be the cwd.
-export const TRUSTED_CWD = 'C:\\Windows\\System32'
-
 export type AzureRepo = { org: string; project: string; repo: string }
 
 // Any `user[:token]@` is matched but never captured.
@@ -31,7 +28,9 @@ const SAFE_NAME = /^[A-Za-z0-9._-]+$/
 const SAFE_PROJECT = /^[A-Za-z0-9._ -]+$/
 const SAFE_BRANCH = /^[A-Za-z0-9._/-]+$/
 
-const isSafe = (value: string, whitelist: RegExp) => whitelist.test(value) && !value.includes('..')
+// A leading hyphen would make a value read as an az option.
+const isSafe = (value: string, whitelist: RegExp) =>
+  whitelist.test(value) && !value.includes('..') && !value.startsWith('-')
 
 // Read-only; undefined when any value falls outside its whitelist.
 export const prArgv = ({ org, project, repo, branch }: AzureRepo & { branch: string }): readonly string[] | undefined => {

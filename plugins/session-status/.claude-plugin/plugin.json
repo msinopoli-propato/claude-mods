@@ -1,6 +1,6 @@
 {
   "name": "session-status",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "One row of status dots above the prompt, in Catppuccin (Latte on light, Macchiato on dark): on desktop the row is one SVG with a rounded capsule, a colored dot per segment and small progress bars; on the terminal, text dots and text bars. Work item (its Azure DevOps title on hover), git branch, branch sync (ahead/behind its upstream, from local refs, no fetch), the branch's Azure DevOps pull request state (read-only, Azure DevOps repos only), each with a plain-language hover, active-time timer and subagent counts, then context (token count on hover) and CPU/RAM/temperature (Windows only); plus a session title with the work item title (needs the Azure CLI, read-only)",
   "author": { "name": "msinopoli" },
   "types": "./types/index.d.ts"
