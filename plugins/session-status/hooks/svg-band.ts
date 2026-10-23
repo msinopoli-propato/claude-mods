@@ -27,6 +27,7 @@ const ROLE_CLASSES: Record<Role, string> = {
   ok: 'r-ok',
   warning: 'r-warning',
   error: 'r-error',
+  muted: 'r-muted',
 }
 
 export const escapeXml = (text: string) =>

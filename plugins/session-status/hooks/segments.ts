@@ -3,9 +3,12 @@ import type {
   SessionStatusBranch,
   SessionStatusContext,
   SessionStatusHealth,
+  SessionStatusPullRequest,
   SessionStatusRun,
+  SessionStatusSync,
 } from '../types'
 import { countAgents } from './agents'
+import { explainPullRequest, explainSync } from './explain'
 import { healthRoles } from './health'
 import type { Role } from './palette'
 import { formatHours } from './timer'
@@ -36,6 +39,9 @@ export type BandData = {
   agents: SessionStatusAgents
   health: SessionStatusHealth | null
   run: SessionStatusRun | null
+  sync: SessionStatusSync | null
+  // The last PR read; drawn only while it belongs to the current branch.
+  pr: SessionStatusPullRequest | null
 }
 
 const PROTECTED_BRANCHES = new Set(['main', 'master', 'dev', 'desarrollo', 'uat'])
@@ -58,6 +64,44 @@ const branchSegment = ({ name, isDirty }: SessionStatusBranch): Segment => {
   const branch = { icon: '⎇', value: `${name}${isDirty ? '*' : ''}` }
   if (PROTECTED_BRANCHES.has(name.toLowerCase())) return { ...branch, role: 'error', bold: true }
   return { ...branch, role: isDirty ? 'warning' : 'branch' }
+}
+
+const syncValue = (sync: SessionStatusSync): Pick<Segment, 'value' | 'role'> => {
+  if (sync === 'local') return { value: '↑ nueva', role: 'warning' }
+  const { ahead, behind } = sync
+  if (ahead > 0 && behind > 0) return { value: `↑${ahead} ↓${behind}`, role: 'error' }
+  if (ahead > 0) return { value: `↑${ahead}`, role: 'warning' }
+  if (behind > 0) return { value: `↓${behind}`, role: 'branch' }
+  return { value: '✓', role: 'ok' }
+}
+
+const syncSegment = (data: BandData): Segment | undefined => {
+  if (!data.branch || !data.sync) return undefined
+  return { icon: '⇅', ...syncValue(data.sync), hover: explainSync(data.sync, data.branch.name) }
+}
+
+const prValue = ({ state, id, approved, reviewers }: SessionStatusPullRequest): Pick<Segment, 'value' | 'role'> => {
+  switch (state) {
+    case 'none':
+      return { value: 'sin PR', role: 'muted' }
+    case 'draft':
+      return { value: `#${id} ✎`, role: 'muted' }
+    case 'waiting':
+      return { value: `#${id} ⏳ ${approved}/${reviewers}`, role: 'timer' }
+    case 'changes':
+      return { value: `#${id} ✗`, role: 'error' }
+    case 'approved':
+      return { value: `#${id} ✓ ${approved}/${reviewers}`, role: 'ok' }
+    case 'completed':
+      return { value: `#${id} ⛙`, role: 'workItem' }
+    case 'abandoned':
+      return { value: `#${id} ⊘`, role: 'muted' }
+  }
+}
+
+const prSegment = ({ branch, pr }: BandData): Segment | undefined => {
+  if (!branch || !pr || pr.branch !== branch.name) return undefined
+  return { icon: 'PR', ...prValue(pr), hover: explainPullRequest(pr) }
 }
 
 const agentsSegment = (data: BandData): Segment | undefined => {
@@ -102,6 +146,8 @@ export const buildBand = (data: BandData): Band => ({
   work: present([
     workItemSegment(data),
     data.branch ? branchSegment(data.branch) : undefined,
+    syncSegment(data),
+    prSegment(data),
     data.run ? { icon: '⏱', value: `${formatHours(data.run.activeMs)}h`, role: 'timer' } : undefined,
     agentsSegment(data),
   ]),
