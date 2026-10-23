@@ -10,8 +10,10 @@ import { cardLeft, cellWidth } from './text-band'
 import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
 import { parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
+import { stepFromCommand } from './step'
 import { parseSync } from './sync'
 import { TRUSTED_CWD } from './trusted'
+import { isDoneState, parseWorkItem, workItemArgv } from './work-item'
 
 type World = {
   branch?: string
@@ -35,6 +37,10 @@ type World = {
   azCalls?: number
   azArgv?: { argv: readonly string[]; init?: { timeoutMs?: number } }
   azGate?: Promise<void>
+  // Work items az knows by id: title, state and Predecessor ids; an id missing here answers azTitle (no relations).
+  workItems?: Record<string, { title?: string; state?: string; predecessors?: string[]; fail?: boolean }>
+  // Every az boards call seen, with its options.
+  azLog?: { argv: readonly string[]; init?: { cwd?: string; timeoutMs?: number } }[]
   store?: Record<string, unknown>
   // git rev-list stdout for the sync read (undefined -> empty, unparsable); `noUpstream` makes it fail.
   revList?: string
@@ -52,6 +58,13 @@ type World = {
 
 const MINUTE = 60_000
 const T0 = Date.UTC(2026, 9, 9, 12, 0, 0)
+
+const PREDECESSOR = 'System.LinkTypes.Dependency-Reverse'
+const relation = (id: string, rel = PREDECESSOR) => ({
+  rel,
+  url: `https://dev.azure.com/propato/_apis/wit/workItems/${id}`,
+  attributes: { isLocked: false, name: 'Predecessor' },
+})
 
 const ok = (stdout: string) => ({
   value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
@@ -74,9 +87,15 @@ const world = (on: any, w: World = {}) => {
     if (e.argv[0] === 'cmd') {
       w.azCalls = (w.azCalls ?? 0) + 1
       w.azArgv = e
+      w.azLog = [...(w.azLog ?? []), e]
       await w.azGate
-      if (w.azTitle === undefined) return fail
-      return ok(JSON.stringify({ 'System.Title': w.azTitle, 'System.State': 'Active' }))
+      const id = e.argv[e.argv.indexOf('--id') + 1]!
+      const item = w.workItems?.[id]
+      if (item?.fail || (!item && w.azTitle === undefined)) return fail
+      const fields = { 'System.Title': item ? item.title : w.azTitle, 'System.State': item?.state ?? 'Active' }
+      if (!e.argv.includes('--expand')) return ok(JSON.stringify(fields))
+      const relations = (item?.predecessors ?? []).map(p => relation(p))
+      return ok(JSON.stringify({ id: Number(id), fields, relations: relations.length > 0 ? relations : null }))
     }
     if (e.argv[0] === 'powershell') {
       w.healthCalls = (w.healthCalls ?? 0) + 1
@@ -498,7 +517,7 @@ test('a run with unknown work item and no branch work item shows WI ?', async ($
   await submit($, '/prosuite-comandos:test-en-vivo')
   await $.turn.complete(turn())
   const rows = await drawRows($)
-  expect(textOfRows(rows)).toBe('◆ ? | ⎇ desarrollo | ⏱ 0.0h')
+  expect(textOfRows(rows)).toBe('◆ ? | ⎇ desarrollo | ▶ prueba | ⏱ 0.0h')
   expect(rows[0]![0]).toMatchObject({ role: 'workItem', bold: true })
 })
 
@@ -508,7 +527,7 @@ test('a run with unknown work item falls back to the branch work item', async ($
   await submit($, '/prosuite-comandos:test-en-vivo') // unknown at start
   w.branch = 'feature/issue-77'
   await $.turn.complete(turn())
-  expect(textOfRows(await drawRows($))).toBe('◆ #77 | ⎇ feature/issue-77 | ⏱ 0.0h')
+  expect(textOfRows(await drawRows($))).toBe('◆ #77 | ⎇ feature/issue-77 | ▶ prueba | ⏱ 0.0h')
 })
 
 test('clean branch is blue, protected branches are bold red even when clean', async ($, on) => {
@@ -620,12 +639,14 @@ for (const surface of SURFACES) {
   })
 
   test(`no cached title, no card or title, and drawing never runs az on ${surface}`, async ($, on) => {
-    const w: World = { branch: 'feature/issue-8423', azTitle: 'Licenses endpoint' }
+    const w: World = { branch: 'feature/issue-8423' } // az fails: nothing gets cached
     const { clock } = world(on, w)
     await $.turn.complete(turn())
+    await clock.settle()
+    const before = w.azCalls
     expect(named(await drawRows($, surface), '◆').hover).toBe(undefined)
     await clock.settle()
-    expect(w.azCalls).toBe(undefined)
+    expect(w.azCalls).toBe(before)
   })
 
   test(`unknown tokens leave the ctx segment without a card or title on ${surface}`, async ($, on) => {
@@ -1160,7 +1181,7 @@ test('an uncached title is set without the description and never awaits az', asy
   expect(await titleOf($)).toBe('WI #8423 · Licenses endpoint · ctx 42%') // the next prompt picks it up
 })
 
-test('the az call is a cmd /d /s /c argv with a 15 second timeout', async ($, on) => {
+test('the az call is a cmd /d /s /c argv with relations and a 15 second timeout', async ($, on) => {
   const w: World = { branch: 'feature/issue-8423', azTitle: 'T' }
   const { clock } = world(on, w)
   await $.turn.complete(turn())
@@ -1168,18 +1189,19 @@ test('the az call is a cmd /d /s /c argv with a 15 second timeout', async ($, on
   await clock.settle()
   expect(w.azArgv?.argv).toEqual([
     'cmd', '/d', '/s', '/c', 'az', 'boards', 'work-item', 'show', '--id', '8423',
-    '--organization', 'https://dev.azure.com/propato', '--query', 'fields', '-o', 'json',
+    '--organization', 'https://dev.azure.com/propato', '--expand', 'relations', '-o', 'json',
   ])
   expect(w.azArgv?.init).toEqual({ cwd: TRUSTED_CWD, timeoutMs: 15_000 })
 })
 
-test('a cached title is used and az never runs', async ($, on) => {
+test('a cached title is used without waiting; the one work item read refreshes it', async ($, on) => {
   const w: World = { branch: 'feature/issue-8423', percent: 42, azTitle: 'Other', store: { 'wi-title:8423': 'Cached title' } }
   const { clock } = world(on, w)
   await $.turn.complete(turn())
   expect(await titleOf($)).toBe('WI #8423 · Cached title · ctx 42%')
   await clock.settle()
-  expect(w.azCalls).toBe(undefined)
+  expect(w.azCalls).toBe(1)
+  expect(await titleOf($)).toBe('WI #8423 · Other · ctx 42%')
 })
 
 test('long cached titles are truncated in the session title', async ($, on) => {
@@ -1209,7 +1231,7 @@ test('concurrent prompts fetch each work item once', async ($, on) => {
   await clock.settle()
 })
 
-test('failures are silent, cache nothing and retry once per session', async ($, on) => {
+test('failures are silent, cache nothing and retry only after 5 minutes', async ($, on) => {
   const w: World = { branch: 'feature/issue-8423', percent: 10 } // azTitle undefined: az fails
   const { clock } = world(on, w)
   await $.turn.complete(turn())
@@ -1217,6 +1239,10 @@ test('failures are silent, cache nothing and retry once per session', async ($, 
     expect(await titleOf($)).toBe('WI #8423 · ctx 10%')
     await clock.settle()
   }
+  expect(w.azCalls).toBe(1)
+  await clock.advance(5 * MINUTE)
+  await titleOf($)
+  await clock.settle()
   expect(w.azCalls).toBe(2)
 })
 
@@ -1655,4 +1681,327 @@ test('muted is Catppuccin overlay0 in both flavors and on the terminal', () => {
 
 test('the hourglass counts as two cells', () => {
   expect(cellWidth('#41 ⏳ 1/2')).toBe(10)
+})
+
+// ---------------------------------------------------------------- WI step
+
+const STEP_COMMANDS = [
+  ['refine-item-perf', 'refine'],
+  ['work-item-std', 'código'],
+  ['work-item-tdd', 'código'],
+  ['work-item-jueces', 'código'],
+  ['work-item-tdd-jueces', 'código'],
+  ['work-item-vivo', 'código'],
+  ['code-review-jueces', 'review'],
+  ['multi-code-review-jueces', 'review'],
+  ['test-en-vivo', 'prueba'],
+] as const
+
+test('every step command maps to its WI step; the rest have none', () => {
+  for (const [command, word] of STEP_COMMANDS) {
+    expect(stepFromCommand(`/prosuite-comandos:${command} 8423`)).toEqual({ word, command })
+    expect(stepFromCommand(`  /prosuite-comandos:${command}`)).toEqual({ word, command })
+  }
+  expect(stepFromCommand('/prosuite-comandos:work-item-tdd\n8423')).toEqual({ word: 'código', command: 'work-item-tdd' })
+  for (const command of ['insights-dia', 'insights-tokens', 'sync-contracts', 'orquestar-orca', 'work-item', 'nope', '']) {
+    expect(stepFromCommand(`/prosuite-comandos:${command} 8423`)).toBe(null)
+  }
+  expect(stepFromCommand('/compact')).toBe(null)
+  expect(stepFromCommand('work-item-tdd 8423')).toBe(null)
+})
+
+const ROAD = 'El camino es refine → código → review → prueba → merge.'
+const STEP_CASES = [
+  {
+    command: 'refine-item-perf',
+    label: '▶ refine',
+    hover: `Paso del WI: estás refinando (refine-item-perf): se define qué hay que hacer. ${ROAD} Qué sigue: implementarlo con /prosuite-comandos:work-item-…`,
+  },
+  {
+    command: 'work-item-tdd-jueces',
+    label: '▶ código',
+    hover: `Paso del WI: estás programando (work-item-tdd-jueces). ${ROAD} Qué sigue: subir la rama, abrir el PR y pedir la review.`,
+  },
+  {
+    command: 'multi-code-review-jueces',
+    label: '▶ review',
+    hover: `Paso del WI: estás en la revisión del PR (multi-code-review-jueces). ${ROAD} Qué sigue: corregir lo que pidan y, con la aprobación, probarlo.`,
+  },
+  {
+    command: 'test-en-vivo',
+    label: '▶ prueba',
+    hover: `Paso del WI: estás probándolo en vivo (test-en-vivo). ${ROAD} Qué sigue: si anda, completar el PR para mergear.`,
+  },
+] as const
+
+for (const surface of SURFACES) {
+  for (const { command, label, hover } of STEP_CASES) {
+    test(`${command} shows ${label} with its hover on ${surface}`, async ($, on) => {
+      world(on, { branch: 'feature/issue-8423' })
+      await submit($, `/prosuite-comandos:${command} 8423`)
+      expect(named(await drawRows($, surface), '▶')).toMatchObject({ label, role: 'workItem', isAlert: false, hover })
+    })
+  }
+
+  test(`the step sits right before the timer on ${surface}`, async ($, on) => {
+    const { clock } = world(on, {
+      branch: BRANCH, revList: '0\t0', remote: AZURE, prs: [pr(41)],
+      percent: 42, health: SAMPLE, agents: [{ id: 'a', status: 'running' }],
+    })
+    await start($, clock)
+    await submit($, '/prosuite-comandos:work-item-tdd 8423')
+    const segs = (await drawRows($, surface)).flat()
+    expect(segs.map(s => s.label.split(' ')[0])).toEqual(['◆', '⎇', '⇅', 'PR', '▶', '⏱', '🤖', 'ctx', 'cpu', 'ram', 'temp'])
+  })
+
+  test(`a run with no step shows the timer alone on ${surface}`, async ($, on) => {
+    world(on, { branch: 'feature/issue-8423' })
+    await submit($, '/prosuite-comandos:insights-dia')
+    await $.turn.complete(turn())
+    expect(await bandText($, surface)).toBe('◆ #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h')
+  })
+}
+
+test('no run, no step; a new command replaces the step', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423' })
+  expect((await bandText($)).includes('▶')).toBe(false)
+  await submit($, '/prosuite-comandos:refine-item-perf 8423')
+  expect(named(await drawRows($), '▶').label).toBe('▶ refine')
+  await submit($, '/prosuite-comandos:code-review-jueces 8423')
+  expect(named(await drawRows($), '▶').label).toBe('▶ review')
+  await submit($, '/prosuite-comandos:sync-contracts')
+  expect((await bandText($)).includes('▶')).toBe(false)
+})
+
+// ---------------------------------------------------------------- blocked by a predecessor
+
+test('parseWorkItem reads the title and the Predecessor ids only', () => {
+  const item = (relations: unknown, fields: unknown = { 'System.Title': 'Licenses' }) => JSON.stringify({ id: 8423, fields, relations })
+  expect(parseWorkItem(item(null))).toEqual({ title: 'Licenses', predecessors: [] })
+  expect(parseWorkItem(item(undefined, {}))).toEqual({ predecessors: [] })
+  expect(parseWorkItem(item([
+    relation('11', 'System.LinkTypes.Dependency-Forward'),
+    relation('12', 'System.LinkTypes.Hierarchy-Reverse'),
+    { rel: 'ArtifactLink', url: 'vstfs:///Git/Commit/abc' },
+  ]))).toEqual({ title: 'Licenses', predecessors: [] })
+  expect(parseWorkItem(item([relation('100'), relation('12', 'System.LinkTypes.Related'), relation('101'), relation('102')])))
+    .toEqual({ title: 'Licenses', predecessors: ['100', '101', '102'] })
+  // A relation whose url does not end in a numeric id is skipped.
+  expect(parseWorkItem(item([{ rel: PREDECESSOR, url: 'https://x/workItems/abc' }, null, relation('7')])))
+    .toEqual({ title: 'Licenses', predecessors: ['7'] })
+})
+
+test('parseWorkItem gives nothing for malformed output', () => {
+  for (const raw of ['', 'not json', 'null', '42', '"text"', '[]', '{"relations":[]}']) expect(parseWorkItem(raw)).toBe(undefined)
+})
+
+test('done states are Closed, Done, Resolved, Removed and Completed, in any case', () => {
+  for (const state of ['Closed', 'Done', 'Resolved', 'Removed', 'Completed', 'closed', 'DONE', ' Resolved ']) {
+    expect(isDoneState(state)).toBe(true)
+  }
+  for (const state of ['Active', 'New', 'In Progress', 'Ready for Test', 'Blocked', '']) expect(isDoneState(state)).toBe(false)
+})
+
+test('the work item argv is constant but for a numeric id', () => {
+  expect(workItemArgv('8423')).toEqual([
+    'cmd', '/d', '/s', '/c', 'az', 'boards', 'work-item', 'show', '--id', '8423',
+    '--organization', 'https://dev.azure.com/propato', '--expand', 'relations', '-o', 'json',
+  ])
+  for (const id of ['', '8423 & calc', '-1', '84a', '--help']) expect(() => workItemArgv(id)).toThrow('invalid work item id')
+})
+
+const BLOCKED_HOVER =
+  'Bloqueado: este WI depende de #100 (Login API), que todavía está en Active. ' +
+  'Hasta que esté terminado, lo tuyo puede quedar trabado. Qué hacer: consultá a quien tiene #100 o avanzá con otra parte.'
+
+const blockedWorld = (extra: World = {}): World => ({
+  branch: BRANCH,
+  workItems: {
+    '8423': { title: 'Licenses', predecessors: ['100', '101'] },
+    '100': { title: 'Login API', state: 'Active' },
+    '101': { title: 'Old', state: 'Closed' },
+  },
+  ...extra,
+})
+
+const expandReads = (w: World) => (w.azLog ?? []).filter(c => c.argv.includes('--expand'))
+const fieldReads = (w: World) => (w.azLog ?? []).filter(c => c.argv.includes('--query'))
+
+for (const surface of SURFACES) {
+  test(`an open predecessor shows a red lock right after the WI on ${surface}`, async ($, on) => {
+    const { clock } = world(on, blockedWorld({ revList: '0\t0', remote: AZURE, prs: [pr(41)] }))
+    await start($, clock)
+    await submit($, '/prosuite-comandos:work-item-tdd 8423')
+    const rows = await drawRows($, surface)
+    expect(rows.flat().map(s => s.label.split(' ')[0])).toEqual(['◆', '🔒', '⎇', '⇅', 'PR', '▶', '⏱'])
+    expect(named(rows, '🔒')).toMatchObject({ label: '🔒 #100', role: 'error', isAlert: true, hover: BLOCKED_HOVER })
+  })
+
+  test(`more than one open predecessor counts the rest on ${surface}`, async ($, on) => {
+    const { clock } = world(on, blockedWorld({
+      workItems: {
+        '8423': { predecessors: ['100', '101', '102', '103'] },
+        '100': { state: 'New' },
+        '101': { title: 'Old', state: 'done' },
+        '102': { title: 'Reports', state: 'Active' },
+        '103': { title: 'Export', state: 'In Progress' },
+      },
+    }))
+    await start($, clock)
+    expect(named(await drawRows($, surface), '🔒')).toMatchObject({
+      label: '🔒 #100 +2',
+      hover:
+        'Bloqueado: este WI depende de #100, que todavía está en New. ' +
+        'Hasta que esté terminado, lo tuyo puede quedar trabado. Qué hacer: consultá a quien tiene #100 o avanzá con otra parte.' +
+        ' También espera: #102, #103.',
+    })
+  })
+}
+
+test('the lock text is escaped in the desktop svg', async ($, on) => {
+  const { clock } = world(on, blockedWorld({ workItems: { '8423': { predecessors: ['100'] }, '100': { title: 'A <b> & "c"', state: 'Active' } } }))
+  await start($, clock)
+  const tree: any = await (await mountBand($, 'desktop')).drawn()
+  expect(tree.children[0].props.source).toContain('#100 (A &lt;b&gt; &amp; &quot;c&quot;)')
+})
+
+test('all predecessors done, or none at all, shows no lock', async ($, on) => {
+  const w = blockedWorld({ workItems: { '8423': { predecessors: ['101'] }, '101': { state: 'Resolved' } } })
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(fieldReads(w)).toHaveLength(1)
+  expect((await bandText($)).includes('🔒')).toBe(false)
+
+  w.workItems = { '8423': {} }
+  await clock.advance(5 * MINUTE)
+  expect(expandReads(w)).toHaveLength(2)
+  expect(fieldReads(w)).toHaveLength(1)
+  expect((await bandText($)).includes('🔒')).toBe(false)
+})
+
+test('the lock shows only for the current work item', async ($, on) => {
+  const w = blockedWorld()
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100')
+  // Another WI: the old lock is not shown, even before the new one is checked.
+  w.branch = 'feature/issue-9001'
+  w.workItems = { ...w.workItems, '9001': { title: 'Free' } }
+  await $.turn.complete(turn())
+  expect((await bandText($)).includes('🔒')).toBe(false)
+  await clock.settle()
+  expect((await bandText($)).includes('🔒')).toBe(false)
+  // A run's work item wins over the branch's, for the lock too.
+  await clock.advance(5 * MINUTE)
+  await submit($, '/prosuite-comandos:work-item-tdd 8423')
+  await clock.settle()
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100')
+})
+
+test('a work item change is checked right away, off the hook chain', async ($, on) => {
+  const w = blockedWorld({ branch: 'main' })
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(expandReads(w)).toHaveLength(0)
+  await submit($, '/prosuite-comandos:work-item-tdd 8423')
+  expect(expandReads(w)).toHaveLength(0) // the prompt resolved without az
+  await clock.settle()
+  expect(expandReads(w).map(c => c.argv[9])).toEqual(['8423'])
+})
+
+test('every az call has a constant argv but for a numeric id, and runs in the trusted cwd', async ($, on) => {
+  const w = blockedWorld()
+  const { clock } = world(on, w)
+  await start($, clock)
+  await titleOf($)
+  await clock.settle()
+  expect(w.azLog?.length).toBe(3)
+  for (const call of w.azLog ?? []) {
+    expect(call.init).toEqual({ cwd: TRUSTED_CWD, timeoutMs: 15_000 })
+    const id = call.argv[9]!
+    expect(id).toMatch(/^\d+$/)
+    expect(call.argv).toEqual(call.argv.includes('--expand') ? workItemArgv(id) : azArgv(id))
+  }
+  expect(expandReads(w).map(c => c.argv[9])).toEqual(['8423'])
+  expect(fieldReads(w).map(c => c.argv[9])).toEqual(['100', '101'])
+})
+
+test('the check runs at most once per 5 minutes per work item', async ($, on) => {
+  const w = blockedWorld()
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(expandReads(w)).toHaveLength(1)
+  await $.turn.complete(turn())
+  await clock.advance(4 * MINUTE + 40_000) // the 20 s poll keeps ticking
+  expect(expandReads(w)).toHaveLength(1)
+  expect(fieldReads(w)).toHaveLength(2)
+  await clock.advance(20_000)
+  expect(expandReads(w)).toHaveLength(2)
+  expect(fieldReads(w)).toHaveLength(4)
+})
+
+test('a predecessor that gets done clears the lock on the next check', async ($, on) => {
+  const w = blockedWorld()
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100')
+  w.workItems = { ...w.workItems, '100': { title: 'Login API', state: 'Closed' } }
+  await clock.advance(5 * MINUTE)
+  expect((await bandText($)).includes('🔒')).toBe(false)
+})
+
+test('at most 5 predecessors are read per check', async ($, on) => {
+  const ids = ['100', '101', '102', '103', '104', '105', '106']
+  const w: World = {
+    branch: BRANCH,
+    workItems: { '8423': { predecessors: ids }, ...Object.fromEntries(ids.map(id => [id, { state: 'Active' }])) },
+  }
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(fieldReads(w).map(c => c.argv[9])).toEqual(['100', '101', '102', '103', '104'])
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100 +4')
+})
+
+test('az never runs in a render or a hook chain', async ($, on) => {
+  let release!: () => void
+  const w = blockedWorld({ azGate: new Promise<void>(r => (release = r)) })
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  await submit($, '/prosuite-comandos:work-item-tdd 8423')
+  await titleOf($)
+  for (const surface of SURFACES) await drawRows($, surface)
+  expect(w.azCalls).toBe(undefined)
+  await clock.settle()
+  expect(w.azCalls).toBe(1)
+  release()
+  await clock.settle()
+  expect(w.azCalls).toBe(3)
+})
+
+test('overlapping checks never start', async ($, on) => {
+  let release!: () => void
+  const w = blockedWorld({ azGate: new Promise<void>(r => (release = r)) })
+  const { clock } = world(on, w)
+  await start($, clock)
+  await clock.advance(6 * MINUTE)
+  expect(expandReads(w)).toHaveLength(1)
+  release()
+  await clock.settle()
+})
+
+test('failing reads are silent and keep the last value', async ($, on) => {
+  const w = blockedWorld()
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100')
+
+  w.workItems = { ...w.workItems, '100': { fail: true } } // a predecessor read fails
+  await clock.advance(5 * MINUTE)
+  expect(expandReads(w)).toHaveLength(2)
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100')
+
+  w.workItems = { ...w.workItems, '8423': { fail: true } } // offline, not logged in, az missing
+  await clock.advance(5 * MINUTE)
+  expect(expandReads(w)).toHaveLength(3)
+  expect(named(await drawRows($), '🔒').label).toBe('🔒 #100')
 })

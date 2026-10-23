@@ -1,7 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun, SessionStatusSync } from '../types'
+import type {
+  SessionStatusBlocker,
+  SessionStatusBranch,
+  SessionStatusContext,
+  SessionStatusRun,
+  SessionStatusSync,
+} from '../types'
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
 import { MACCHIATO, ROLE_COLORS } from './palette'
@@ -10,7 +16,7 @@ import { buildBand } from './segments'
 import { rowAlt, svgRow } from './svg-band'
 import { SYNC_ARGS, parseSync } from './sync'
 import { SEGMENT_GAP, cardLeft, segmentRuns } from './text-band'
-import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
+import { AZ_TIMEOUT_MS, azArgv, composeTitle, titleKey } from './title'
 import { TRUSTED_CWD } from './trusted'
 import type { Segment } from './segments'
 import {
@@ -24,6 +30,7 @@ import {
   workItemFromCommand,
   workItemLabel,
 } from './timer'
+import { BLOCKED_INTERVAL_MS, MAX_PREDECESSORS, isDoneState, parseBlocker, parseWorkItem, workItemArgv } from './work-item'
 
 // Branches follow feature/issue-{ID} or fix/issue-{ID}; worktrees follow <repo>-issue-{ID}.
 const WORK_ITEM = /(?:^|[/-])issue-(\d+)(?:$|[/-])/i
@@ -45,6 +52,7 @@ const health = atom({ plugin: 'session-status', key: 'health' } as const, null)
 const run = atom({ plugin: 'session-status', key: 'run' } as const, null)
 const sync = atom({ plugin: 'session-status', key: 'sync' } as const, null)
 const pr = atom({ plugin: 'session-status', key: 'pr' } as const, null)
+const blocked = atom({ plugin: 'session-status', key: 'blocked' } as const, null)
 
 const SECTION_ID = 'session-status:wi-time'
 
@@ -105,6 +113,7 @@ const refresh = async ($: Engine) => {
   ])
   // A new branch gets its PR read right away, off the hook chain that refreshed it.
   if (current && current.name !== previous?.name) $.clock.after(0, () => void readPullRequest($))
+  await kickOnWorkItemChange($)
 }
 
 // The work item a command run belongs to: its args first, then the branch or worktree.
@@ -150,42 +159,99 @@ const readHealth = async ($: Engine) => {
   }
 }
 
-// Work item titles: fetched once per work item from Azure DevOps (read-only) and kept in $.store.
-// Fetches run off a timer, never inside a hook chain; attempts are counted per session.
-const titleFetches = new Set<string>()
-const titleAttempts = new Map<string, number>()
-const MAX_TITLE_ATTEMPTS = 2 // the first try plus one retry
+// The work item the band is about: the active run's, else the branch's.
+const readCurrentWorkItem = async ($: Engine) => {
+  const [current, branchItem] = await Promise.all([read($, run), read($, workItem)])
+  return current?.workItem ?? branchItem ?? undefined
+}
 
-const fetchWorkItemTitle = async ($: Engine, id: string) => {
-  const attempts = titleAttempts.get(id) ?? 0
-  if (titleFetches.has(id) || attempts >= MAX_TITLE_ATTEMPTS) return
-  titleFetches.add(id)
-  titleAttempts.set(id, attempts + 1)
-  try {
-    const { exitCode, stdout } = await $.process.run(azArgv(id), { cwd: TRUSTED_CWD, timeoutMs: AZ_TIMEOUT_MS })
-    const title = exitCode === 0 ? parseWorkItemTitle(stdout) : undefined
-    if (title) await $.store.set(titleKey(id), title)
-  } catch {
-    // Not logged in, offline, az missing: silent, nothing cached.
-  } finally {
-    titleFetches.delete(id)
+// One read-only az call; its stdout, or undefined when it fails (not logged in, offline, az missing).
+const az = async ($: Engine, argv: readonly string[]) => {
+  const { exitCode, stdout } = await $.process.run(argv, { cwd: TRUSTED_CWD, timeoutMs: AZ_TIMEOUT_MS })
+  return exitCode === 0 ? stdout : undefined
+}
+
+// The first MAX_PREDECESSORS predecessors' states, one at a time; undefined if any of them cannot be read.
+const readBlockers = async ($: Engine, ids: readonly string[]) => {
+  const blockers: SessionStatusBlocker[] = []
+  for (const id of ids.slice(0, MAX_PREDECESSORS)) {
+    const stdout = await az($, azArgv(id))
+    const blocker = stdout === undefined ? undefined : parseBlocker(id, stdout)
+    if (!blocker) return undefined
+    blockers.push(blocker)
   }
+  return blockers
+}
+
+// The current work item from Azure DevOps (read-only): one read caches its title in $.store and lists its
+// Predecessors, whose states say whether it is blocked. At most once per BLOCKED_INTERVAL_MS per work item;
+// any failure keeps the last value.
+const blockedChecks = new Map<string, number>()
+
+const checkWorkItemOnce = async ($: Engine) => {
+  const id = await readCurrentWorkItem($)
+  if (!id) return
+  const now = await $.clock.now()
+  const last = blockedChecks.get(id)
+  if (last !== undefined && now - last < BLOCKED_INTERVAL_MS) return
+  blockedChecks.set(id, now)
+
+  const stdout = await az($, workItemArgv(id))
+  const item = stdout === undefined ? undefined : parseWorkItem(stdout)
+  if (!item) return
+  if (item.title) await $.store.set(titleKey(id), item.title)
+  const blockers = await readBlockers($, item.predecessors)
+  if (!blockers) return
+  const by = blockers.filter(({ state }) => !isDoneState(state))
+  await update($, blocked, () => (by.length > 0 ? { workItem: id, by } : null))
+}
+
+// Off the timer or a clock.after only: never in a hook chain or a render. One check at a time; a request that
+// arrives meanwhile reruns it once after (the throttle keeps that from reading again). A hot reload resets both.
+let workItemCheck: Promise<void> | undefined
+let isWorkItemCheckRequested = false
+
+function checkWorkItem($: Engine): Promise<void> {
+  if (workItemCheck) {
+    isWorkItemCheckRequested = true
+    return workItemCheck
+  }
+  workItemCheck = (async () => {
+    try {
+      do {
+        isWorkItemCheckRequested = false
+        await checkWorkItemOnce($).catch(() => undefined)
+      } while (isWorkItemCheckRequested)
+    } finally {
+      workItemCheck = undefined
+    }
+  })()
+  return workItemCheck
+}
+
+// A new current work item is checked right away, off the hook chain that noticed it.
+let lastWorkItem: string | undefined
+
+async function kickOnWorkItemChange($: Engine) {
+  const id = await readCurrentWorkItem($)
+  if (!id || id === lastWorkItem) return
+  lastWorkItem = id
+  $.clock.after(0, () => void checkWorkItem($))
 }
 
 // The session title for the current work item, or undefined to leave the engine's own. Never awaits az.
 const buildSessionTitle = async ($: Engine): Promise<string | undefined> => {
-  const [current, branchItem] = await Promise.all([read($, run), read($, workItem)])
-  const id = current?.workItem ?? branchItem
+  const id = await readCurrentWorkItem($)
   if (!id) return undefined
 
   const cached = await $.store.get(titleKey(id))
-  if (typeof cached !== 'string') $.clock.after(0, () => void fetchWorkItemTitle($, id))
+  if (typeof cached !== 'string') $.clock.after(0, () => void checkWorkItem($))
 
   const usage = await $.session.usage().catch(() => undefined)
   return composeTitle(id, typeof cached === 'string' ? cached : undefined, usage?.context.percent)
 }
 
-// The band's hover card: only what is already cached. A render never starts an az fetch; the session title does.
+// The band's hover card: only what is already cached. A render never starts an az read.
 const readCachedTitle = async ($: Engine, id: string | null | undefined) => {
   if (!id) return null
   const cached = await $.store.get(titleKey(id)).catch(() => undefined)
@@ -252,7 +318,7 @@ const syncAgents = ($: Engine): Promise<void> => {
 
 // One timer period: every read runs off the timer, never inside a hook chain.
 const poll = async ($: Engine) => {
-  await Promise.all([readHealth($), syncAgents($).catch(() => undefined), readPullRequest($)])
+  await Promise.all([readHealth($), syncAgents($).catch(() => undefined), readPullRequest($), checkWorkItem($)])
 }
 
 export const register: Register = on => {
@@ -281,7 +347,8 @@ export const register: Register = on => {
   on('prompt.submit', async ($, e, next) => {
     if (isProsuiteCommand(e.text)) {
       const [now, item] = await Promise.all([$.clock.now(), resolveRunWorkItem($, e.text)])
-      await update($, run, () => startRun(item, now))
+      await update($, run, () => startRun(item, now, e.text))
+      await kickOnWorkItemChange($)
     } else {
       await recordActivity($)
     }
@@ -352,7 +419,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
-    const [currentBranch, branchItem, currentContext, currentAgents, currentHealth, currentRun, currentSync, currentPr] =
+    const [currentBranch, branchItem, currentContext, currentAgents, currentHealth, currentRun, currentSync, currentPr, currentBlocked] =
       await Promise.all([
         read($, branch),
         read($, workItem),
@@ -362,6 +429,7 @@ export const register: Register = on => {
         read($, run),
         read($, sync),
         read($, pr),
+        read($, blocked),
       ])
     const band = buildBand({
       branch: currentBranch,
@@ -373,6 +441,7 @@ export const register: Register = on => {
       run: currentRun,
       sync: currentSync,
       pr: currentPr,
+      blocked: currentBlocked,
     })
     // One row: the work segments, then the gauges.
     const rows = [[...band.work, ...band.gauges]].filter(row => row.length > 0)
