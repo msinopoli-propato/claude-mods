@@ -1,10 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { Engine, Register } from 'claude-code'
+import type { EngineInterface as Engine, Register } from 'claude-code'
 
 import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun } from '../types'
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
-import { buildSegments } from './segments'
+import { buildBand } from './segments'
 import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
 import type { Segment } from './segments'
 import {
@@ -150,6 +150,13 @@ const buildSessionTitle = async ($: Engine): Promise<string | undefined> => {
   return composeTitle(id, typeof cached === 'string' ? cached : undefined, usage?.context.percent)
 }
 
+// The band's hover card: only what is already cached. A render never starts an az fetch; the session title does.
+const readCachedTitle = async ($: Engine, id: string | null | undefined) => {
+  if (!id) return null
+  const cached = await $.store.get(titleKey(id)).catch(() => undefined)
+  return typeof cached === 'string' ? cached : null
+}
+
 // Merges the engine's agent list into the session tally; callers never let a failure reach a turn or tool call.
 // Serialized: a request that arrives while a read is in flight waits for it plus one fresh rerun, so a stale
 // list can never overwrite a newer one.
@@ -277,23 +284,54 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
-    const segments = buildSegments({
-      branch: await read($, branch),
-      workItem: await read($, workItem),
-      context: await read($, context),
-      agents: await read($, agents),
-      health: await read($, health),
-      run: await read($, run),
+    const [currentBranch, branchItem, currentContext, currentAgents, currentHealth, currentRun] = await Promise.all([
+      read($, branch),
+      read($, workItem),
+      read($, context),
+      read($, agents),
+      read($, health),
+      read($, run),
+    ])
+    const band = buildBand({
+      branch: currentBranch,
+      workItem: branchItem,
+      title: await readCachedTitle($, currentRun?.workItem ?? branchItem),
+      context: currentContext,
+      agents: currentAgents,
+      health: currentHealth,
+      run: currentRun,
     })
-    if (segments.length === 0) return next(e)
+    const rows = [band.work, band.gauges].filter(row => row.length > 0)
+    if (rows.length === 0) return next(e)
 
     const { Box, Text } = $.ui.resolve(e)
-    const drawn = segments.flatMap((segment: Segment, index: number) => {
-      const { text, ...style } = segment
-      const part = <Text {...style}>{text}</Text>
-      return index === 0 ? [part] : [<Text dimColor>{' · '}</Text>, part]
-    })
 
-    return <Box>{drawn}</Box>
+    // A chip: inverse text on the segment's color, one space of padding each side.
+    const pill = ({ text, color, bold }: Segment) => (
+      <Text color="inverseText" backgroundColor={color} {...(bold ? { bold } : {})}>{` ${text} `}</Text>
+    )
+
+    // A pill with a hover gets a keyed Box (the hover scope) and a hidden absolute card that opens on the same
+    // row, right after the pill and its gap: the band clips what lies outside it, so a card above or below a
+    // one-row band would not show. Painting over the neighbours moves nothing.
+    const drawSegment = (segment: Segment, key: string) => {
+      if (!segment.hover) return pill(segment)
+      return (
+        <Box key={key}>
+          {pill(segment)}
+          <Box position="absolute" top={0} left={segment.text.length + 3} display="none" hover={{ display: 'flex' }}>
+            {pill({ ...segment, text: segment.hover })}
+          </Box>
+        </Box>
+      )
+    }
+
+    return (
+      <Box flexDirection="column">
+        {rows.map((row, r) => (
+          <Box gap={1}>{row.map((segment, index) => drawSegment(segment, `pill-${r}-${index}`))}</Box>
+        ))}
+      </Box>
+    )
   })
 }

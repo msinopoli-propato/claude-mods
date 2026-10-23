@@ -28,11 +28,11 @@ export const parseWorkItemTitle = (stdout: string): string | undefined => {
   }
 }
 
-// Trim, collapse whitespace, cut to 40 characters (the last one an ellipsis).
-export const describeTitle = (raw: string | undefined): string | undefined => {
+// Trim, collapse whitespace, cut to `limit` characters (the last one an ellipsis). 40 fits a session title.
+export const describeTitle = (raw: string | undefined, limit = DESCRIPTION_LIMIT): string | undefined => {
   const text = raw?.replace(/\s+/g, ' ').trim()
   if (!text) return undefined
-  return text.length > DESCRIPTION_LIMIT ? `${text.slice(0, DESCRIPTION_LIMIT - 1)}…` : text
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text
 }
 
 export const composeTitle = (workItem: string, description: string | undefined, contextPercent: number | undefined) =>

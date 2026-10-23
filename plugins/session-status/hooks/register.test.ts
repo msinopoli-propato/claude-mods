@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { parseHealth, healthColors } from './health'
+import { contextBar } from './segments'
 import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
 
@@ -113,20 +114,47 @@ const BAND_PROPS = {
 
 const SURFACES = ['terminal', 'desktop'] as const
 
-type Segment = { text: string; color?: unknown; bold?: unknown; dimColor?: unknown }
-
-const drawBand = async ($: any, surface: (typeof SURFACES)[number], props: object = BAND_PROPS) => {
-  const ui = await $.ui.mount({ plugin: 'session-status', surface, component: 'AbovePrompt', props })
-  const texts = await ui.findAll({ type: 'Text' })
-  return texts.map((t: any): Segment => ({ text: t.text, ...t.props }))
+// A pill as drawn: its Text's props, its shown text and, for a keyed pill, the hover card beside it.
+type Pill = {
+  text: string
+  label: string
+  color?: unknown
+  backgroundColor?: unknown
+  bold?: unknown
+  hover?: string
+  card?: Record<string, unknown>
 }
 
-const segmentsOf = (all: Segment[]) => all.filter(s => s.text !== ' · ')
-const named = (all: Segment[], prefix: string) => segmentsOf(all).find(s => s.text.startsWith(prefix))!
-const branchOf = (all: Segment[]) => segmentsOf(all).find(s => s.text.startsWith('⎇'))
+const textOf = (node: any): string =>
+  typeof node === 'string' ? node : (node?.children ?? []).map(textOf).join('')
+
+const pillOf = (node: any): Pill => {
+  if (node.type === 'Text') {
+    const text = textOf(node)
+    return { ...node.props, text, label: text.trim() }
+  }
+  const [glyph, card] = node.children
+  return { ...pillOf(glyph), hover: textOf(card).trim(), card: { ...card.props, hover: card.hover } }
+}
+
+// The band's rows of pills; the engine's own empty Box (the plugin passed) is no rows.
+const drawRows = async ($: any, surface: (typeof SURFACES)[number] = 'terminal', props: object = BAND_PROPS) => {
+  const ui = await $.ui.mount({ plugin: 'session-status', surface, component: 'AbovePrompt', props })
+  const tree: any = await ui.drawn()
+  return (tree.children ?? []).map((row: any): Pill[] => row.children.map(pillOf))
+}
+
+const textOfRows = (rows: Pill[][]) => rows.map(row => row.map(p => p.label).join(' | ')).join('\n')
+const named = (rows: Pill[][], prefix: string) => rows.flat().find(p => p.label.startsWith(prefix))!
+const branchOf = (rows: Pill[][]) => rows.flat().find(p => p.label.startsWith('⎇'))
+const bandText = async ($: any, surface: (typeof SURFACES)[number] = 'terminal') => textOfRows(await drawRows($, surface))
 
 const compose = ($: any) =>
   $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] })
+
+// The kit's inputs carry every field the engine fills; the plugin reads only these.
+const submit = ($: any, text: string) => $.prompt.submit({ text })
+const spawn = ($: any, prompt: string) => $.agent.spawn({ prompt })
 
 const wiTime = async ($: any) => (await $.command.run({ command: 'wi-time' })).text as string
 
@@ -140,77 +168,97 @@ test('finds the work item in branch and worktree names', () => {
 
 // ---------------------------------------------------------------- band
 
+test('the context bar has 8 cells, one per 12.5%, clamped', () => {
+  expect(contextBar(0)).toBe('▱▱▱▱▱▱▱▱')
+  expect(contextBar(5)).toBe('▱▱▱▱▱▱▱▱')
+  expect(contextBar(42)).toBe('▰▰▰▱▱▱▱▱')
+  expect(contextBar(50)).toBe('▰▰▰▰▱▱▱▱')
+  expect(contextBar(100)).toBe('▰▰▰▰▰▰▰▰')
+  expect(contextBar(130)).toBe('▰▰▰▰▰▰▰▰')
+  expect(contextBar(-5)).toBe('▱▱▱▱▱▱▱▱')
+})
+
 for (const surface of SURFACES) {
-  test(`band draws colored segments on ${surface}`, async ($, on) => {
+  test(`band draws work and gauge rows of pills on ${surface}`, async ($, on) => {
     world(on, { branch: 'feature/issue-8423', porcelain: ' M a.cs\n', percent: 42, tokens: 84_200 })
     await $.turn.complete(turn())
-    const all = await drawBand($, surface)
+    const rows = await drawRows($, surface)
 
-    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-8423* · ctx 42% (84k)')
-    const [wi, branch, ctx] = segmentsOf(all)
-    expect(branch.color).toBe('warning')
-    expect(wi).toMatchObject({ color: 'claude', bold: true })
-    expect(ctx.color).toBe('success')
-    expect(all.filter(s => s.text === ' · ').every(s => s.dimColor === true)).toBe(true)
+    expect(textOfRows(rows)).toBe('WI #8423 | ⎇ feature/issue-8423*\nctx ▰▰▰▱▱▱▱▱ 42%')
+    const [[wi, branch], [ctx]] = rows
+    expect(wi).toMatchObject({ backgroundColor: 'claude', bold: true })
+    expect(branch.backgroundColor).toBe('warning')
+    expect(ctx.backgroundColor).toBe('success')
   })
 
-  test(`band shows the timer segment on ${surface}`, async ($, on) => {
+  test(`every pill is inverse text on its color, padded one space each side, on ${surface}`, async ($, on) => {
+    const { clock } = world(on, { branch: 'feature/issue-8423', percent: 42, health: SAMPLE, agents: [{ id: 'a', status: 'running' }] })
+    await start($, clock)
+    await submit($, '/prosuite-comandos:work-item 8423')
+    const pills = (await drawRows($, surface)).flat()
+    expect(pills).toHaveLength(8)
+    for (const pill of pills) {
+      expect(pill.color).toBe('inverseText')
+      expect(typeof pill.backgroundColor).toBe('string')
+      expect(pill.text).toBe(` ${pill.label} `)
+    }
+  })
+
+  test(`band shows the timer pill on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 10 })
-    await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+    await submit($, '/prosuite-comandos:work-item 8423')
     for (let i = 0; i < 9; i++) {
       await clock.advance(9 * MINUTE) // 81 minutes of steady activity: 1.35h
       await $.turn.complete(turn())
     }
-    const all = await drawBand($, surface)
-    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-8423 · ⏱ 1.3h · ctx 10%')
-    expect(named(all, '⏱')).toMatchObject({ text: '⏱ 1.3h', color: 'permission' })
+    const rows = await drawRows($, surface)
+    expect(textOfRows(rows)).toBe('WI #8423 | ⎇ feature/issue-8423 | ⏱ 1.3h\nctx ▰▱▱▱▱▱▱▱ 10%')
+    expect(named(rows, '⏱')).toMatchObject({ label: '⏱ 1.3h', backgroundColor: 'permission' })
   })
 }
 
 test('an active run wins over the branch work item and WI is shown once', async ($, on) => {
   world(on, { branch: 'feature/issue-1111', percent: 10 })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-1111 · ⏱ 0.0h · ctx 10%')
+  expect(textOfRows(await drawRows($))).toBe('WI #8423 | ⎇ feature/issue-1111 | ⏱ 0.0h\nctx ▰▱▱▱▱▱▱▱ 10%')
 })
 
 test('a run with unknown work item and no branch work item shows WI ?', async ($, on) => {
   world(on, { branch: 'desarrollo' })
-  await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' })
+  await submit($, '/prosuite-comandos:test-en-vivo')
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI ? · ⎇ desarrollo · ⏱ 0.0h')
-  expect(segmentsOf(all)[0]).toMatchObject({ color: 'claude', bold: true })
+  const rows = await drawRows($)
+  expect(textOfRows(rows)).toBe('WI ? | ⎇ desarrollo | ⏱ 0.0h')
+  expect(rows[0][0]).toMatchObject({ backgroundColor: 'claude', bold: true })
 })
 
 test('a run with unknown work item falls back to the branch work item', async ($, on) => {
   const w: World = { branch: 'desarrollo' }
   world(on, w)
-  await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' }) // unknown at start
+  await submit($, '/prosuite-comandos:test-en-vivo') // unknown at start
   w.branch = 'feature/issue-77'
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI #77 · ⎇ feature/issue-77 · ⏱ 0.0h')
+  expect(textOfRows(await drawRows($))).toBe('WI #77 | ⎇ feature/issue-77 | ⏱ 0.0h')
 })
 
 test('clean branch is green, protected branches are bold red even when clean', async ($, on) => {
   const w: World = { branch: 'feature/issue-5' }
   world(on, w)
   await $.turn.complete(turn())
-  expect(branchOf(await drawBand($, 'terminal'))).toMatchObject({ text: '⎇ feature/issue-5', color: 'success' })
+  expect(branchOf(await drawRows($))).toMatchObject({ label: '⎇ feature/issue-5', backgroundColor: 'success' })
 
   for (const name of ['main', 'master', 'dev', 'desarrollo', 'UAT']) {
     w.branch = name
     await $.turn.complete(turn())
-    expect(branchOf(await drawBand($, 'terminal'))).toMatchObject({ text: `⎇ ${name}`, color: 'error', bold: true })
+    expect(branchOf(await drawRows($))).toMatchObject({ label: `⎇ ${name}`, backgroundColor: 'error', bold: true })
   }
 })
 
 test('dirty protected branch stays red and shows the asterisk', async ($, on) => {
   world(on, { branch: 'main', porcelain: ' M a.cs\n' })
   await $.turn.complete(turn())
-  expect(branchOf(await drawBand($, 'desktop'))).toMatchObject({ text: '⎇ main*', color: 'error', bold: true })
+  expect(branchOf(await drawRows($, 'desktop'))).toMatchObject({ label: '⎇ main*', backgroundColor: 'error', bold: true })
 })
 
 test('context color follows the thresholds', async ($, on) => {
@@ -220,23 +268,23 @@ test('context color follows the thresholds', async ($, on) => {
   for (const [percent, color] of cases) {
     w.percent = percent
     await $.turn.complete(turn())
-    const ctx = segmentsOf(await drawBand($, 'terminal')).find(s => s.text.startsWith('ctx'))!
-    expect([percent, ctx.color]).toEqual([percent, color])
+    const ctx = named(await drawRows($), 'ctx')
+    expect([percent, ctx.backgroundColor]).toEqual([percent, color])
   }
 })
 
 test('reads the work item from a Windows worktree path', async ($, on) => {
   world(on, { branch: 'desarrollo', cwd: 'C:\\Repos\\worktrees\\stock-api-issue-912' })
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('WI #912 · ⎇ desarrollo')
+  expect(textOfRows(await drawRows($))).toBe('WI #912 | ⎇ desarrollo')
 })
 
-test('outside a git repo it shows only the work item, if any, and usage', async ($, on) => {
+test('outside a git repo the empty work row is omitted and only the gauges show', async ($, on) => {
   world(on, { percent: 5 })
   await $.turn.complete(turn())
-  const all = await drawBand($, 'desktop')
-  expect(all.map(s => s.text).join('')).toBe('ctx 5%')
+  const rows = await drawRows($, 'desktop')
+  expect(rows).toHaveLength(1)
+  expect(textOfRows(rows)).toBe('ctx ▱▱▱▱▱▱▱▱ 5%')
 })
 
 test('ignores subagent turns', async ($, on) => {
@@ -253,11 +301,75 @@ test('yields the band to a survey', async ($, on) => {
   expect(await ui.findAll({ type: 'Text' })).toHaveLength(0)
 })
 
+// ---------------------------------------------------------------- hover cards
+
+const REVEAL = { position: 'absolute', top: 0, display: 'none', hover: { display: 'flex' } }
+
+for (const surface of SURFACES) {
+  test(`a cached work item title is a hover card beside the WI pill on ${surface}`, async ($, on) => {
+    world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
+    await $.turn.complete(turn())
+    const wi = named(await drawRows($, surface), 'WI')
+    expect(wi).toMatchObject({ label: 'WI #8423', backgroundColor: 'claude', hover: 'Licenses endpoint' })
+    // Opens right after the pill and its gap, over the rest of the row.
+    expect(wi.card).toMatchObject({ ...REVEAL, left: ' WI #8423 '.length + 1 })
+  })
+
+  test(`the token count is a hover card on the ctx pill on ${surface}`, async ($, on) => {
+    world(on, { branch: 'x', percent: 42, tokens: 84_200 })
+    await $.turn.complete(turn())
+    const ctx = named(await drawRows($, surface), 'ctx')
+    expect(ctx).toMatchObject({ label: 'ctx ▰▰▰▱▱▱▱▱ 42%', hover: '84k tokens' })
+    expect(ctx.card).toMatchObject({ ...REVEAL, left: ' ctx ▰▰▰▱▱▱▱▱ 42% '.length + 1 })
+  })
+}
+
+test('the card text is inverse on the pill color, padded', async ($, on) => {
+  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': 'Licenses endpoint' } })
+  await $.turn.complete(turn())
+  const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+  const card = await ui.find({ type: 'Text', text: 'Licenses endpoint' })
+  expect(card).toMatchObject({ text: ' Licenses endpoint ', props: { color: 'inverseText', backgroundColor: 'claude' } })
+})
+
+test('long titles are cut to 60 characters on the card', async ($, on) => {
+  const title = 'Connector.Visma - BE Endpoint de listado de licencias con filtros por fecha y estado'
+  world(on, { branch: 'feature/issue-8423', store: { 'wi-title:8423': title } })
+  await $.turn.complete(turn())
+  expect(named(await drawRows($), 'WI').hover).toBe(`${title.slice(0, 59)}…`)
+})
+
+test('describeTitle takes a longer limit for the card', () => {
+  expect(describeTitle('a'.repeat(60), 60)).toBe('a'.repeat(60))
+  expect(describeTitle('a'.repeat(61), 60)).toBe(`${'a'.repeat(59)}…`)
+})
+
+test('no cached title, no card, and drawing never runs az', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423', azTitle: 'Licenses endpoint' }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  expect(named(await drawRows($), 'WI').hover).toBe(undefined)
+  await clock.settle()
+  expect(w.azCalls).toBe(undefined)
+})
+
+test('the card follows the run work item', async ($, on) => {
+  world(on, { branch: 'feature/issue-1111', store: { 'wi-title:1111': 'Branch item', 'wi-title:9001': 'Run item' } })
+  await submit($, '/prosuite-comandos:work-item 9001')
+  expect(named(await drawRows($), 'WI').hover).toBe('Run item')
+})
+
+test('unknown tokens leave the ctx pill without a card', async ($, on) => {
+  world(on, { branch: 'x', percent: 42 })
+  await $.turn.complete(turn())
+  expect(named(await drawRows($), 'ctx').hover).toBe(undefined)
+})
+
 // ---------------------------------------------------------------- timer
 
 test('excludes gaps longer than ten minutes entirely', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' }) // t = 0
+  await submit($, '/prosuite-comandos:work-item 8423') // t = 0
   await clock.advance(5 * MINUTE)
   await $.tool.call({ tool: 'Bash', command: 'ls' }) // t = 5
   await clock.advance(15 * MINUTE)
@@ -267,7 +379,7 @@ test('excludes gaps longer than ten minutes entirely', async ($, on) => {
 
 test('a gap of exactly ten minutes still counts', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   await clock.advance(10 * MINUTE)
   await $.turn.complete(turn())
   expect(await wiTime($)).toContain('active 0h 10m')
@@ -275,9 +387,9 @@ test('a gap of exactly ten minutes still counts', async ($, on) => {
 
 test('prompts, tool calls and main turns are all activity; subagent turns are not', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   await clock.advance(2 * MINUTE)
-  await $.prompt.submit({ text: 'continue' })
+  await submit($, 'continue')
   await clock.advance(3 * MINUTE)
   await $.tool.call({ tool: 'Bash', command: 'ls' })
   await clock.advance(4 * MINUTE)
@@ -289,75 +401,72 @@ test('prompts, tool calls and main turns are all activity; subagent turns are no
 
 test('a new prosuite-comandos command resets the run', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   await clock.advance(8 * MINUTE)
   await $.turn.complete(turn())
   expect(await wiTime($)).toContain('WI #8423 · active 0h 8m')
 
   await clock.advance(2 * MINUTE)
-  await $.prompt.submit({ text: '/prosuite-comandos:code-review-jueces 9001' })
+  await submit($, '/prosuite-comandos:code-review-jueces 9001')
   expect(await wiTime($)).toContain('WI #9001 · active 0h 0m')
 })
 
 test('other slash commands do not start a run', async ($, on) => {
   world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/compact' })
-  await $.prompt.submit({ text: 'hello' })
+  await submit($, '/compact')
+  await submit($, 'hello')
   expect(await wiTime($)).toBe('No prosuite-comandos run is active.')
 })
 
 test('work item comes from the first standalone number of 2+ digits in the args', async ($, on) => {
   world(on, { branch: 'feature/issue-1111' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item-tdd 7 fix v2 8423 9999' })
+  await submit($, '/prosuite-comandos:work-item-tdd 7 fix v2 8423 9999')
   expect(await wiTime($)).toContain('WI #8423')
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item #4567' })
+  await submit($, '/prosuite-comandos:work-item #4567')
   expect(await wiTime($)).toContain('WI #4567')
 })
 
 test('falls back to the branch, then the worktree path, when the args name no work item', async ($, on) => {
   const w: World = { branch: 'feature/issue-1111' }
   world(on, w)
-  await $.prompt.submit({ text: '/prosuite-comandos:refine-item-perf' })
+  await submit($, '/prosuite-comandos:refine-item-perf')
   expect(await wiTime($)).toContain('WI #1111')
 
   w.branch = 'desarrollo'
   w.cwd = 'C:\\Repos\\worktrees\\api-issue-912'
-  await $.prompt.submit({ text: '/prosuite-comandos:refine-item-perf 5 words' })
+  await submit($, '/prosuite-comandos:refine-item-perf 5 words')
   expect(await wiTime($)).toContain('WI #912')
 })
 
 test('unknown work item shows a question mark in the band', async ($, on) => {
   world(on, { branch: 'desarrollo' })
-  await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' })
+  await submit($, '/prosuite-comandos:test-en-vivo')
   await $.turn.complete(turn())
   expect(await wiTime($)).toContain('WI ?')
-  const timer = segmentsOf(await drawBand($, 'terminal')).find(s => s.text.startsWith('⏱'))!
-  expect(timer).toMatchObject({ text: '⏱ 0.0h', color: 'permission' })
+  expect(named(await drawRows($), '⏱')).toMatchObject({ label: '⏱ 0.0h', backgroundColor: 'permission' })
 })
 
 test('hours are rounded down, never up', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   for (let i = 0; i < 11; i++) {
     await clock.advance(9 * MINUTE) // 99 minutes in total: 1.65h
     await $.turn.complete(turn())
   }
-  const timer = segmentsOf(await drawBand($, 'terminal')).find(s => s.text.startsWith('⏱'))!
-  expect(timer.text).toBe('⏱ 1.6h')
+  expect(named(await drawRows($), '⏱').label).toBe('⏱ 1.6h')
 })
 
 test('the session ending closes the run', async ($, on) => {
   world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   await $.session.end({ reason: 'other', sessionId: 's1', resume: {} as never })
   expect(await wiTime($)).toBe('No prosuite-comandos run is active.')
 })
 
-test('no run, no timer segment', async ($, on) => {
+test('no run, no timer pill', async ($, on) => {
   world(on, { branch: 'feature/issue-8423' })
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.some(s => s.text.startsWith('⏱'))).toBe(false)
+  expect(named(await drawRows($), '⏱')).toBe(undefined)
 })
 
 // ------------------------------------------------------- prompt injection
@@ -368,7 +477,7 @@ test('injects the measured time into the system prompt only while a run is activ
   const before = await compose($)
   expect(before.sections.map((s: { id: string }) => s.id)).toEqual(['intro'])
 
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   await clock.advance(5 * MINUTE)
   await $.turn.complete(turn())
 
@@ -383,7 +492,7 @@ test('injects the measured time into the system prompt only while a run is activ
 
 test('the injected hours track the measured time', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   for (let i = 0; i < 9; i++) {
     await clock.advance(9 * MINUTE)
     await $.turn.complete(turn())
@@ -394,7 +503,7 @@ test('the injected hours track the measured time', async ($, on) => {
 
 test('the injection says the work item is unknown when none was found', async ($, on) => {
   world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:test-en-vivo' })
+  await submit($, '/prosuite-comandos:test-en-vivo')
   const { sections } = await compose($)
   expect(sections.at(-1)!.text).toContain('(work item unknown)')
 })
@@ -409,7 +518,7 @@ test('registers /wi-time at session start', async ($, on) => {
 
 test('/wi-time prints work item, active time and run start', async ($, on) => {
   const { clock } = world(on, { branch: 'main' })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+  await submit($, '/prosuite-comandos:work-item 8423')
   for (let i = 0; i < 9; i++) {
     await clock.advance(9 * MINUTE)
     await $.turn.complete(turn())
@@ -449,26 +558,26 @@ test('colors follow the thresholds of each metric', () => {
 })
 
 for (const surface of SURFACES) {
-  test(`band draws CPU, RAM and temperature after ctx on ${surface}`, async ($, on) => {
+  test(`band draws CPU, RAM and temperature after ctx in the gauge row on ${surface}`, async ($, on) => {
     const { clock } = world(on, { branch: 'feature/issue-8423', percent: 42, tokens: 84_200, health: SAMPLE })
     await start($, clock)
-    await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
-    const all = await drawBand($, surface)
+    await submit($, '/prosuite-comandos:work-item 8423')
+    const rows = await drawRows($, surface)
 
-    expect(all.map(s => s.text).join('')).toBe(
-      'WI #8423 · ⎇ feature/issue-8423 · ⏱ 0.0h · ctx 42% (84k) · CPU 27% · RAM 75% · 62°C',
+    expect(textOfRows(rows)).toBe(
+      'WI #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h\nctx ▰▰▰▱▱▱▱▱ 42% | CPU 27% | RAM 75% | 62°C',
     )
-    const [cpu, ram, temp] = ['CPU', 'RAM', '62'].map(prefix => named(all, prefix))
-    expect([cpu.color, ram.color, temp.color]).toEqual(['success', 'warning', 'success'])
+    const [cpu, ram, temp] = (['CPU', 'RAM', '62'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
+    expect([cpu.backgroundColor, ram.backgroundColor, temp.backgroundColor]).toEqual(['success', 'warning', 'success'])
   })
 }
 
 test('colors reach the band per metric', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '95|1000|4000|3700' })
   await start($, clock)
-  const all = await drawBand($, 'terminal')
-  const [cpu, ram, temp] = ['CPU', 'RAM', '97'].map(prefix => named(all, prefix))
-  expect([cpu, ram, temp].map(s => [s.text, s.color])).toEqual([
+  const rows = await drawRows($)
+  const [cpu, ram, temp] = (['CPU', 'RAM', '97'] as const).map(prefix => named(rows, prefix)) as [Pill, Pill, Pill]
+  expect([cpu, ram, temp].map(s => [s.label, s.backgroundColor])).toEqual([
     ['CPU 95%', 'error'],
     ['RAM 75%', 'warning'],
     ['97°C', 'error'],
@@ -478,20 +587,19 @@ test('colors reach the band per metric', async ($, on) => {
 test('missing temperature leaves CPU and RAM only', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: '27|8195448|33177908|' })
   await start($, clock)
-  const texts = (await drawBand($, 'terminal')).map(s => s.text).join('')
-  expect(texts).toBe('⎇ x · CPU 27% · RAM 75%')
+  expect(await bandText($)).toBe('⎇ x\nCPU 27% | RAM 75%')
 })
 
-test('a failing or unparsable read omits the whole segment', async ($, on) => {
+test('a failing or unparsable read omits the health pills', async ($, on) => {
   const failing = world(on, { branch: 'x' })
   await start($, failing.clock)
-  expect((await drawBand($, 'terminal')).map(s => s.text).join('')).toBe('⎇ x')
+  expect(await bandText($)).toBe('⎇ x')
 })
 
-test('unparsable stdout omits the segment too', async ($, on) => {
+test('unparsable stdout omits them too', async ($, on) => {
   const { clock } = world(on, { branch: 'x', health: 'garbage' })
   await start($, clock)
-  expect((await drawBand($, 'desktop')).map(s => s.text).join('')).toBe('⎇ x')
+  expect(await bandText($, 'desktop')).toBe('⎇ x')
 })
 
 test('reads on an interval of 20 seconds and redraws the new value', async ($, on) => {
@@ -499,13 +607,13 @@ test('reads on an interval of 20 seconds and redraws the new value', async ($, o
   const { clock } = world(on, w)
   await start($, clock)
   const ui = await $.ui.mount({ plugin: 'session-status', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-  expect((await ui.find({ type: 'Text', text: /^CPU/ }))?.text).toBe('CPU 27%')
+  expect((await ui.find({ type: 'Text', text: /CPU/ }))?.text.trim()).toBe('CPU 27%')
 
   w.health = '50|1000|4000|3352'
   await clock.advance(19_000)
-  expect((await ui.find({ type: 'Text', text: /^CPU/ }))?.text).toBe('CPU 27%')
+  expect((await ui.find({ type: 'Text', text: /CPU/ }))?.text.trim()).toBe('CPU 27%')
   await clock.advance(1_000)
-  expect((await ui.find({ type: 'Text', text: /^CPU/ }))?.text).toBe('CPU 50%')
+  expect((await ui.find({ type: 'Text', text: /CPU/ }))?.text.trim()).toBe('CPU 50%')
   expect(w.healthCalls).toBe(2)
 })
 
@@ -546,11 +654,8 @@ test('the interval stops when the session ends', async ($, on) => {
 
 // ---------------------------------------------------------------- subagents
 
-const bandText = async ($: any, surface: (typeof SURFACES)[number] = 'terminal') =>
-  (await drawBand($, surface)).map(s => s.text).join('')
-
 for (const surface of SURFACES) {
-  test(`subagents segment sits after the timer and before ctx on ${surface}`, async ($, on) => {
+  test(`one agents pill closes the work row, after the timer, on ${surface}`, async ($, on) => {
     const w: World = {
       branch: 'feature/issue-8423',
       percent: 10,
@@ -563,39 +668,44 @@ for (const surface of SURFACES) {
       ],
     }
     world(on, w)
-    await $.prompt.submit({ text: '/prosuite-comandos:work-item 8423' })
+    await submit($, '/prosuite-comandos:work-item 8423')
     await $.turn.complete(turn())
-    const all = await drawBand($, surface)
-    expect(all.map(s => s.text).join('')).toBe('WI #8423 · ⎇ feature/issue-8423 · ⏱ 0.0h · 🤖 2 running · 3 done · ctx 10%')
-
-    const [running, done] = ['🤖', '3 done'].map(prefix => named(all, prefix))
-    expect(running).toMatchObject({ color: 'warning', bold: true })
-    expect(done.color).toBe('success')
+    const rows = await drawRows($, surface)
+    expect(textOfRows(rows)).toBe('WI #8423 | ⎇ feature/issue-8423 | ⏱ 0.0h | 🤖 2 ▸ 3 ✓\nctx ▰▱▱▱▱▱▱▱ 10%')
+    expect(named(rows, '🤖')).toMatchObject({ backgroundColor: 'warning', bold: true })
   })
 }
 
-test('without a timer the segment follows the branch', async ($, on) => {
+test('without a timer the agents pill follows the branch', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', agents: [{ id: 'a', status: 'running' }] })
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('WI #8423 · ⎇ feature/issue-8423 · 🤖 1 running · 0 done')
+  expect(await bandText($)).toBe('WI #8423 | ⎇ feature/issue-8423 | 🤖 1 ▸ 0 ✓')
 })
 
-test('running is dim when nothing runs, and failed shows only when above zero', async ($, on) => {
+test('nothing running is green, and failed shows only when above zero', async ($, on) => {
   world(on, { branch: 'x', agents: [{ id: 'a', status: 'completed' }] })
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('⎇ x · 🤖 0 running · 1 done')
-  const running = named(all, '🤖')
-  expect(running.dimColor).toBe(true)
-  expect(running.bold).toBe(undefined)
+  const rows = await drawRows($)
+  expect(textOfRows(rows)).toBe('⎇ x | 🤖 0 ▸ 1 ✓')
+  const agents = named(rows, '🤖')
+  expect(agents.backgroundColor).toBe('success')
+  expect(agents.bold).toBe(undefined)
 })
 
-test('failed and killed agents land in the failed bucket', async ($, on) => {
+test('failed and killed agents land in the failed count, red when nothing runs', async ($, on) => {
   world(on, { branch: 'x', agents: [{ id: 'a', status: 'failed' }, { id: 'b', status: 'killed' }, { id: 'c', status: 'completed' }] })
   await $.turn.complete(turn())
-  const all = await drawBand($, 'terminal')
-  expect(all.map(s => s.text).join('')).toBe('⎇ x · 🤖 0 running · 1 done · 2 failed')
-  expect(named(all, '2 failed')).toMatchObject({ text: '2 failed', color: 'error' })
+  const rows = await drawRows($)
+  expect(textOfRows(rows)).toBe('⎇ x | 🤖 0 ▸ 1 ✓ 2 ✗')
+  expect(named(rows, '🤖').backgroundColor).toBe('error')
+})
+
+test('running wins the color over failed', async ($, on) => {
+  world(on, { branch: 'x', agents: [{ id: 'a', status: 'failed' }, { id: 'b', status: 'running' }] })
+  await $.turn.complete(turn())
+  const rows = await drawRows($)
+  expect(textOfRows(rows)).toBe('⎇ x | 🤖 1 ▸ 0 ✓ 1 ✗')
+  expect(named(rows, '🤖')).toMatchObject({ backgroundColor: 'warning', bold: true })
 })
 
 test('idle teammates are neither running nor done', async ($, on) => {
@@ -606,7 +716,7 @@ test('idle teammates are neither running nor done', async ($, on) => {
 
   w.agents = [{ id: 'a', status: 'idle' }, { id: 'b', status: 'running' }]
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 0 done')
+  expect(await bandText($)).toBe('⎇ x | 🤖 1 ▸ 0 ✓')
 })
 
 test('the tally survives the engine dropping finished agents', async ($, on) => {
@@ -616,11 +726,11 @@ test('the tally survives the engine dropping finished agents', async ($, on) => 
   }
   world(on, w)
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 1 done · 1 failed')
+  expect(await bandText($)).toBe('⎇ x | 🤖 1 ▸ 1 ✓ 1 ✗')
 
   w.agents = [] // the engine forgot them all; c vanished while still active, so it counts as done
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('⎇ x · 🤖 0 running · 2 done · 1 failed')
+  expect(await bandText($)).toBe('⎇ x | 🤖 0 ▸ 2 ✓ 1 ✗')
 })
 
 test('a subagent turn marks its own spawned agent by reason', async ($, on) => {
@@ -628,13 +738,13 @@ test('a subagent turn marks its own spawned agent by reason', async ($, on) => {
   world(on, w)
   for (const id of ['s1', 's2', 's3']) {
     w.spawnId = id
-    await $.agent.spawn({ prompt: 'work' })
+    await spawn($, 'work')
   }
-  expect(await bandText($)).toBe('🤖 3 running · 0 done')
+  expect(await bandText($)).toBe('🤖 3 ▸ 0 ✓')
   await $.turn.complete(turn({ agentId: 's1', reason: 'answer' }))
   await $.turn.complete(turn({ agentId: 's2', reason: 'error' }))
   await $.turn.complete(turn({ agentId: 's3', reason: 'aborted' }))
-  expect(await bandText($)).toBe('🤖 0 running · 1 done · 2 failed')
+  expect(await bandText($)).toBe('🤖 0 ▸ 1 ✓ 2 ✗')
 })
 
 test('engine forks (compaction, memory) never enter the tally', async ($, on) => {
@@ -650,15 +760,15 @@ test('engine forks (compaction, memory) never enter the tally', async ($, on) =>
 test('a freshly spawned agent absent from the list is not counted done', async ($, on) => {
   const w: World = { branch: 'x', agents: [] }
   world(on, w)
-  await $.agent.spawn({ prompt: 'work' })
+  await spawn($, 'work')
   await $.turn.complete(turn()) // the list does not name it yet
-  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 0 done')
+  expect(await bandText($)).toBe('⎇ x | 🤖 1 ▸ 0 ✓')
 
   w.agents = [{ id: 'spawned-1', status: 'running' }] // now seen in the list...
   await $.turn.complete(turn())
   w.agents = [] // ...and then the engine drops it while it was still active
   await $.turn.complete(turn())
-  expect(await bandText($)).toBe('⎇ x · 🤖 0 running · 1 done')
+  expect(await bandText($)).toBe('⎇ x | 🤖 0 ▸ 1 ✓')
 })
 
 test('list reads are serialized and the newest one wins', async ($, on) => {
@@ -677,21 +787,21 @@ test('list reads are serialized and the newest one wins', async ($, on) => {
   release()
   await Promise.all(turns)
   expect(w.agentListCalls).toBe(2) // exactly one rerun for all the requests that arrived meanwhile
-  expect(await bandText($)).toBe('⎇ x · 🤖 0 running · 1 done')
+  expect(await bandText($)).toBe('⎇ x | 🤖 0 ▸ 1 ✓')
 })
 
 test('a subagent turn overrides a stale running status in the list', async ($, on) => {
   world(on, { branch: 'x', agents: [{ id: 's1', status: 'running' }] })
   await $.turn.complete(turn({ agentId: 's1', reason: 'answer' }))
-  expect(await bandText($)).toBe('🤖 0 running · 1 done')
+  expect(await bandText($)).toBe('🤖 0 ▸ 1 ✓')
 })
 
 test('spawning an agent refreshes the tally', async ($, on) => {
   const w: World = { branch: 'x', agents: [] }
   world(on, w)
   w.agents = [{ id: 'spawned-1', status: 'running' }]
-  await $.agent.spawn({ prompt: 'read the readme' })
-  expect(await bandText($)).toBe('🤖 1 running · 0 done')
+  await spawn($, 'read the readme')
+  expect(await bandText($)).toBe('🤖 1 ▸ 0 ✓')
 })
 
 test('the 20 second tick refreshes the tally', async ($, on) => {
@@ -701,7 +811,7 @@ test('the 20 second tick refreshes the tally', async ($, on) => {
   expect(await bandText($)).toBe('⎇ x')
   w.agents = [{ id: 'a', status: 'running' }]
   await clock.advance(20_000)
-  expect(await bandText($)).toBe('⎇ x · 🤖 1 running · 0 done')
+  expect(await bandText($)).toBe('⎇ x | 🤖 1 ▸ 0 ✓')
 })
 
 test('no subagents, no segment; a failing list never breaks a turn', async ($, on) => {
@@ -829,7 +939,7 @@ test('failures are silent, cache nothing and retry once per session', async ($, 
 
 test('an active run work item wins over the branch one', async ($, on) => {
   world(on, { branch: 'feature/issue-8423', store: { 'wi-title:9001': 'Run item' } })
-  await $.prompt.submit({ text: '/prosuite-comandos:work-item 9001' })
+  await submit($, '/prosuite-comandos:work-item 9001')
   expect(await titleOf($)).toBe('WI #9001 · Run item')
 })
 
