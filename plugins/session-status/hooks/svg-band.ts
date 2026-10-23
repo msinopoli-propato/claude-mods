@@ -38,9 +38,12 @@ const px = (value: number) => String(Math.round(value * 10) / 10)
 
 const textWidth = (text: string) => cellWidth(text) * ADVANCE
 
+const CAP_OPACITY = 0.4
+
 const rules = (flavor: Flavor) =>
   [
-    `.cap{fill:${flavor.surface}}`,
+    // Translucent so the capsule blends into the host's own band instead of reading as a box inside a box.
+    `.cap{fill:${flavor.surface};fill-opacity:${CAP_OPACITY}}`,
     `.muted{fill:${flavor.overlay}}`,
     `.text{fill:${flavor.text}}`,
     `.track{fill:${tint(flavor.text, flavor.base, 0.2)}}`,
