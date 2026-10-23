@@ -9,6 +9,8 @@ import { escapeXml, rowAlt, svgRow } from './svg-band'
 import { cardLeft, cellWidth } from './text-band'
 import { azArgv, composeTitle, describeTitle, parseWorkItemTitle } from './title'
 import { findWorkItem } from './register'
+import { TRUSTED_CWD, parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
+import { parseSync } from './sync'
 
 type World = {
   branch?: string
@@ -33,6 +35,18 @@ type World = {
   azArgv?: { argv: readonly string[]; init?: { timeoutMs?: number } }
   azGate?: Promise<void>
   store?: Record<string, unknown>
+  // git rev-list stdout for the sync read (undefined -> empty, unparsable); `noUpstream` makes it fail.
+  revList?: string
+  noUpstream?: boolean
+  // Every git argv seen, with its options.
+  gitCalls?: { argv: readonly string[]; init?: { cwd?: string } }[]
+  // git remote get-url origin (undefined -> the command fails).
+  remote?: string
+  // az repos pr list: the PRs as JSON (a string is raw stdout; undefined -> the command fails).
+  prs?: unknown[] | string
+  prCalls?: number
+  prArgv?: { argv: readonly string[]; init?: { cwd?: string; timeoutMs?: number } }
+  prGate?: Promise<void>
 }
 
 const MINUTE = 60_000
@@ -48,7 +62,14 @@ const fail = { value: { exitCode: 128, stdout: '', stderr: 'not a git repository
 const world = (on: any, w: World = {}) => {
   const registered: string[] = []
   const clock = mock.clock(on, { now: T0 })
-  on('process.run', async (_$: unknown, e: { argv: readonly string[]; init?: { timeoutMs?: number } }) => {
+  on('process.run', async (_$: unknown, e: { argv: readonly string[]; init?: { cwd?: string; timeoutMs?: number } }) => {
+    if (e.argv[0] === 'cmd' && e.argv.includes('repos')) {
+      w.prCalls = (w.prCalls ?? 0) + 1
+      w.prArgv = e
+      await w.prGate
+      if (w.prs === undefined) return fail
+      return ok(typeof w.prs === 'string' ? w.prs : JSON.stringify(w.prs))
+    }
     if (e.argv[0] === 'cmd') {
       w.azCalls = (w.azCalls ?? 0) + 1
       w.azArgv = e
@@ -62,7 +83,11 @@ const world = (on: any, w: World = {}) => {
       await w.healthGate
       return w.health === undefined ? fail : ok(w.health)
     }
+    w.gitCalls = [...(w.gitCalls ?? []), e]
     if (w.branch === undefined) return fail
+    if (e.argv.includes('rev-list')) return w.noUpstream ? fail : ok(w.revList ?? '')
+    if (e.argv.includes('remote')) return w.remote === undefined ? fail : ok(`${w.remote}
+`)
     return e.argv.includes('rev-parse') ? ok(`${w.branch}\n`) : ok(w.porcelain ?? '')
   })
   on('session.cwd', () => ({ value: w.cwd ?? 'C:\\Repos\\app' }))
@@ -132,7 +157,9 @@ type Part = { text: string; color?: unknown; backgroundColor?: unknown; dimColor
 const partOf = (node: any): Part => ({ ...node.props, text: textOf(node) })
 
 const ROLE_OF_COLOR = Object.fromEntries(Object.entries(ROLE_COLORS).map(([role, color]) => [color, role])) as Record<string, Role>
-const ROLE_OF_CLASS: Record<string, Role> = { wi: 'workItem', branch: 'branch', timer: 'timer', ok: 'ok', warning: 'warning', error: 'error' }
+const ROLE_OF_CLASS: Record<string, Role> = {
+  wi: 'workItem', branch: 'branch', timer: 'timer', ok: 'ok', warning: 'warning', error: 'error', muted: 'muted',
+}
 
 // Terminal: a keyed Box per segment holding the dot, the dim icon, the bar of a percent gauge and the value,
 // plus its hover card.
@@ -1210,4 +1237,405 @@ test('only a numeric work item id can reach cmd', () => {
   expect(azArgv('8423')).toContain('8423')
   expect(() => azArgv('8423 & calc')).toThrow('invalid work item id')
   expect(() => azArgv('')).toThrow('invalid work item id')
+})
+
+// ---------------------------------------------------------------- branch sync
+
+test('parses rev-list as behind, then ahead', () => {
+  expect(parseSync('0\t0')).toEqual({ ahead: 0, behind: 0 })
+  expect(parseSync('3\t2\n')).toEqual({ ahead: 2, behind: 3 })
+  expect(parseSync('0 1\r\n')).toEqual({ ahead: 1, behind: 0 })
+  expect(parseSync('')).toBe(undefined)
+  expect(parseSync('fatal: no upstream')).toBe(undefined)
+  expect(parseSync('1\t2\t3')).toBe(undefined)
+})
+
+const SYNC_CASES = [
+  {
+    world: { revList: '0\t0' },
+    label: '⇅ ✓',
+    role: 'ok',
+    hover: 'Tu rama: está igual en tu compu y en el servidor. No hay nada para subir ni para bajar.',
+  },
+  {
+    world: { revList: '0\t1' },
+    label: '⇅ ↑1',
+    role: 'warning',
+    hover: 'Tu rama: tenés 1 commit solo en tu compu; nadie más los ve. Qué hacer: git push',
+  },
+  {
+    world: { revList: '0\t3' },
+    label: '⇅ ↑3',
+    role: 'warning',
+    hover: 'Tu rama: tenés 3 commits solo en tu compu; nadie más los ve. Qué hacer: git push',
+  },
+  {
+    world: { revList: '2\t0' },
+    label: '⇅ ↓2',
+    role: 'branch',
+    hover: 'Tu rama: el servidor tiene 2 commits que vos no tenés (según el último fetch). Qué hacer: git pull',
+  },
+  {
+    world: { revList: '1\t0' },
+    label: '⇅ ↓1',
+    role: 'branch',
+    hover: 'Tu rama: el servidor tiene 1 commit que vos no tenés (según el último fetch). Qué hacer: git pull',
+  },
+  {
+    world: { revList: '4\t2' },
+    label: '⇅ ↑2 ↓4',
+    role: 'error',
+    hover:
+      'Tu rama: se separó del servidor: 2 tuyos sin subir y 4 del servidor sin bajar (según el último fetch). ' +
+      'Qué hacer: git pull y después git push',
+  },
+  {
+    world: { noUpstream: true },
+    label: '⇅ ↑ nueva',
+    role: 'warning',
+    hover: 'Tu rama: existe solo en tu compu; el servidor no la conoce. Qué hacer: git push -u origin feature/issue-8423',
+  },
+] as const
+
+for (const surface of SURFACES) {
+  for (const { world: extra, label, role, hover } of SYNC_CASES) {
+    test(`sync ${label} is ${role} with its hover on ${surface}`, async ($, on) => {
+      world(on, { branch: 'feature/issue-8423', ...extra })
+      await $.turn.complete(turn())
+      const isAlert = role === 'warning' || role === 'error'
+      expect(named(await drawRows($, surface), '⇅')).toMatchObject({ label, role, hover, isAlert })
+    })
+  }
+}
+
+test('the sync read is rev-list against the upstream in the session cwd, never a fetch', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423', revList: '0\t0', cwd: 'C:\\Repos\\api' }
+  world(on, w)
+  await $.turn.complete(turn())
+  const seen = w.gitCalls ?? []
+  const revList = seen.find(e => e.argv.includes('rev-list'))
+  expect(revList?.argv).toEqual(['git', 'rev-list', '--left-right', '--count', '@{upstream}...HEAD'])
+  expect(revList?.init?.cwd).toBe('C:\\Repos\\api')
+  expect(seen.some(e => e.argv.includes('fetch'))).toBe(false)
+})
+
+test('an unparsable rev-list or no branch shows no sync segment', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423' }
+  world(on, w)
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('◆ #8423 | ⎇ feature/issue-8423')
+  w.branch = undefined
+  await $.turn.complete(turn())
+  expect(await bandText($)).toBe('')
+})
+
+test('the sync follows the branch on each refresh', async ($, on) => {
+  const w: World = { branch: 'feature/issue-8423', revList: '0\t1' }
+  world(on, w)
+  await $.turn.complete(turn())
+  expect(named(await drawRows($), '⇅').label).toBe('⇅ ↑1')
+  w.revList = '0\t0'
+  await $.tool.call({ tool: 'Bash', command: 'git push' })
+  expect(named(await drawRows($), '⇅').label).toBe('⇅ ✓')
+})
+
+// ---------------------------------------------------------------- pull request
+
+const BRANCH = 'feature/issue-8423'
+const AZURE = 'https://propato@dev.azure.com/propato/Software%20Factory/_git/app'
+
+const pr = (id: number, extra: Record<string, unknown> = {}) => ({
+  pullRequestId: id,
+  status: 'active',
+  isDraft: false,
+  sourceRefName: `refs/heads/${BRANCH}`,
+  creationDate: '2026-10-01T10:00:00Z',
+  reviewers: [],
+  ...extra,
+})
+
+const reviewer = (vote: number, isContainer = false) => ({ vote, isContainer, displayName: 'R' })
+
+const parsed = (prs: unknown[]) => parsePullRequests(JSON.stringify(prs), BRANCH)
+
+const APP = { org: 'propato', project: 'Software Factory', repo: 'app' }
+
+test('Azure DevOps remotes parse to org, project and repo; credentials are dropped', () => {
+  expect(parseAzureRemote(AZURE)).toEqual(APP)
+  expect(parseAzureRemote('https://dev.azure.com/propato/Software%20Factory/_git/app\n')).toEqual(APP)
+  expect(parseAzureRemote('https://me:s3cr3t@dev.azure.com/propato/Software%20Factory/_git/app')).toEqual(APP)
+  expect(parseAzureRemote('https://propato.visualstudio.com/Software%20Factory/_git/app')).toEqual(APP)
+  expect(parseAzureRemote('https://propato.visualstudio.com/DefaultCollection/Software%20Factory/_git/app')).toEqual(APP)
+  expect(parseAzureRemote('git@ssh.dev.azure.com:v3/propato/Software%20Factory/app')).toEqual(APP)
+})
+
+test('anything else is not an Azure DevOps remote', () => {
+  expect(parseAzureRemote('https://github.com/acme/app.git')).toBe(undefined)
+  expect(parseAzureRemote('https://dev.azure.com/propato/_git/app')).toBe(undefined)
+  expect(parseAzureRemote('https://evil.com/dev.azure.com/a/b/_git/c')).toBe(undefined)
+  expect(parseAzureRemote('https://dev.azure.com/propato/p/_git/%E0%A4%A')).toBe(undefined)
+  expect(parseAzureRemote('')).toBe(undefined)
+})
+
+test('the az argv targets the repo and branch explicitly, without --detect', () => {
+  expect(prArgv({ ...APP, branch: BRANCH })).toEqual([
+    'cmd', '/d', '/s', '/c', 'az', 'repos', 'pr', 'list', '--detect', 'false',
+    '--organization', 'https://dev.azure.com/propato', '--project', 'Software Factory', '--repository', 'app',
+    '--source-branch', BRANCH, '--status', 'all', '--top', '20', '-o', 'json',
+  ])
+})
+
+test('a value outside its whitelist never reaches the cmd argv', () => {
+  expect(prArgv({ ...APP, branch: BRANCH })).toBeDefined()
+  for (const bad of ['a&b', 'a|b', 'a^b', '%PATH%', 'a"b', 'a<b', 'a>b', 'a\nb', '..', 'a/../b', '']) {
+    expect(prArgv({ ...APP, branch: bad })).toBe(undefined)
+    expect(prArgv({ ...APP, branch: BRANCH, org: bad })).toBe(undefined)
+    expect(prArgv({ ...APP, branch: BRANCH, project: bad })).toBe(undefined)
+    expect(prArgv({ ...APP, branch: BRANCH, repo: bad })).toBe(undefined)
+  }
+  // Slashes belong only in branches, spaces only in projects.
+  expect(prArgv({ ...APP, branch: BRANCH, org: 'a/b' })).toBe(undefined)
+  expect(prArgv({ ...APP, branch: BRANCH, repo: 'a b' })).toBe(undefined)
+})
+
+test('no PR for the branch is none', () => {
+  expect(parsed([])).toEqual({ state: 'none', id: null, approved: 0, reviewers: 0 })
+  // A PR from another branch, even one whose name starts the same, does not count.
+  expect(parsed([pr(1, { sourceRefName: 'refs/heads/feature/issue-84230' }), pr(2, { sourceRefName: 'refs/heads/main' })]))
+    .toEqual({ state: 'none', id: null, approved: 0, reviewers: 0 })
+})
+
+test('an active draft is draft, whatever the votes', () => {
+  expect(parsed([pr(7, { isDraft: true, reviewers: [reviewer(-10)] })])).toMatchObject({ state: 'draft', id: 7 })
+})
+
+test('any rejection or wait-for-author vote is changes', () => {
+  expect(parsed([pr(7, { reviewers: [reviewer(10), reviewer(-5)] })])).toMatchObject({ state: 'changes', id: 7 })
+  expect(parsed([pr(7, { reviewers: [reviewer(-10)] })])).toMatchObject({ state: 'changes' })
+})
+
+test('approved needs every person reviewer at 5 or 10; containers are not counted', () => {
+  expect(parsed([pr(7, { reviewers: [reviewer(10), reviewer(5), reviewer(0, true)] })]))
+    .toEqual({ state: 'approved', id: 7, approved: 2, reviewers: 2 })
+  expect(parsed([pr(7, { reviewers: [reviewer(10), reviewer(0)] })]))
+    .toEqual({ state: 'waiting', id: 7, approved: 1, reviewers: 2 })
+  // Only a group reviewer: nobody has approved yet.
+  expect(parsed([pr(7, { reviewers: [reviewer(10, true)] })])).toEqual({ state: 'waiting', id: 7, approved: 0, reviewers: 0 })
+  expect(parsed([pr(7)])).toEqual({ state: 'waiting', id: 7, approved: 0, reviewers: 0 })
+})
+
+test('completed and abandoned PRs keep their status', () => {
+  expect(parsed([pr(7, { status: 'completed', reviewers: [reviewer(10)] })])).toMatchObject({ state: 'completed', id: 7 })
+  expect(parsed([pr(7, { status: 'abandoned' })])).toMatchObject({ state: 'abandoned', id: 7 })
+})
+
+test('the newest PR of the branch wins', () => {
+  expect(parsed([
+    pr(5, { status: 'abandoned', creationDate: '2026-09-01T10:00:00Z' }),
+    pr(9, { creationDate: '2026-10-20T10:00:00Z' }),
+    pr(7, { status: 'completed', creationDate: '2026-10-01T10:00:00Z' }),
+  ])).toMatchObject({ state: 'waiting', id: 9 })
+})
+
+test('malformed az output parses to nothing', () => {
+  expect(parsePullRequests('not json', BRANCH)).toBe(undefined)
+  expect(parsePullRequests('{"value":[]}', BRANCH)).toBe(undefined)
+  expect(parsePullRequests('null', BRANCH)).toBe(undefined)
+  // Junk entries are skipped, not fatal.
+  expect(parsePullRequests(JSON.stringify([null, 3, pr(4)]), BRANCH)).toMatchObject({ state: 'waiting', id: 4 })
+})
+
+const PR_CASES = [
+  {
+    prs: [],
+    label: 'PR sin PR',
+    role: 'muted',
+    hover:
+      'El PR: todavía no abriste un Pull Request para esta rama, así que nadie está revisando tu trabajo. ' +
+      'Qué hacer: cuando termines y subas todo, abrilo en Azure DevOps.',
+  },
+  {
+    prs: [pr(41, { isDraft: true })],
+    label: 'PR #41 ✎',
+    role: 'muted',
+    hover: 'El PR: #41 está en borrador; nadie tiene que revisarlo todavía. Qué hacer: cuando esté listo, tocá Publish en el PR.',
+  },
+  {
+    prs: [pr(41, { reviewers: [reviewer(10), reviewer(0)] })],
+    label: 'PR #41 ⏳ 1/2',
+    role: 'timer',
+    hover: 'El PR: #41 espera revisión; aprobaron 1 de 2. Qué hacer: esperá, o avisale a quien revisa si es urgente.',
+  },
+  {
+    prs: [pr(41, { reviewers: [reviewer(-5)] })],
+    label: 'PR #41 ✗',
+    role: 'error',
+    hover:
+      'El PR: en #41 pidieron cambios o lo rechazaron. ' +
+      'Qué hacer: leé los comentarios, corregí, commiteá y hacé git push; el PR se actualiza solo.',
+  },
+  {
+    prs: [pr(41, { reviewers: [reviewer(10), reviewer(5)] })],
+    label: 'PR #41 ✓ 2/2',
+    role: 'ok',
+    hover: 'El PR: #41 está aprobado (2 de 2). Qué hacer: tocá Complete en el PR para mezclarlo.',
+  },
+  {
+    prs: [pr(41, { status: 'completed' })],
+    label: 'PR #41 ⛙',
+    role: 'workItem',
+    hover: 'El PR: #41 ya se mezcló en la rama principal. Qué hacer: nada; podés pasar al próximo WI.',
+  },
+  {
+    prs: [pr(41, { status: 'abandoned' })],
+    label: 'PR #41 ⊘',
+    role: 'muted',
+    hover: 'El PR: #41 se cerró sin mezclar. Qué hacer: si fue un error, reactivalo desde Azure DevOps.',
+  },
+] as const
+
+for (const surface of SURFACES) {
+  for (const { prs, label, role, hover } of PR_CASES) {
+    test(`PR ${label} is ${role} with its hover on ${surface}`, async ($, on) => {
+      const { clock } = world(on, { branch: BRANCH, remote: AZURE, prs: [...prs] })
+      await start($, clock)
+      const isAlert = role === 'error'
+      expect(named(await drawRows($, surface), 'PR')).toMatchObject({ label, role, hover, isAlert })
+    })
+  }
+}
+
+test('az runs in the trusted cwd while the remote is read in the session cwd', async ($, on) => {
+  const w: World = { branch: BRANCH, remote: 'https://me:s3cr3t@dev.azure.com/propato/Software%20Factory/_git/app', prs: [], cwd: 'C:\\Repos\\api' }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  await clock.settle()
+  expect(w.prCalls).toBe(1)
+  expect(w.prArgv?.argv).toEqual(prArgv({ ...APP, branch: BRANCH }))
+  expect(w.prArgv?.argv.some(arg => arg.includes('s3cr3t') || arg.includes('me:'))).toBe(false)
+  expect(TRUSTED_CWD).toBe('C:\\Windows\\System32')
+  expect(w.prArgv?.init).toEqual({ cwd: TRUSTED_CWD, timeoutMs: 20_000 })
+  expect(w.gitCalls?.find(c => c.argv.includes('remote'))?.init?.cwd).toBe('C:\\Repos\\api')
+})
+
+for (const [why, facts] of [
+  ['a hostile branch', { branch: 'feature/a&calc', remote: AZURE }],
+  ['a hostile remote', { branch: BRANCH, remote: 'https://dev.azure.com/a%26calc/p/_git/app' }],
+] as const) {
+  test(`${why} shows no PR segment and never runs az`, async ($, on) => {
+    const w: World = { ...facts, prs: [pr(41)] }
+    const { clock } = world(on, w)
+    await start($, clock)
+    expect(w.prCalls).toBe(undefined)
+    expect((await drawRows($)).flat().some(s => s.label.startsWith('PR'))).toBe(false)
+  })
+}
+
+test('a GitHub remote shows no PR segment and never runs az', async ($, on) => {
+  const w: World = { branch: BRANCH, remote: 'https://github.com/acme/app.git', prs: [pr(41)] }
+  const { clock } = world(on, w)
+  await start($, clock)
+  await clock.advance(5 * MINUTE)
+  expect(w.prCalls).toBe(undefined)
+  expect((await drawRows($)).flat().some(s => s.label.startsWith('PR'))).toBe(false)
+})
+
+test('no origin remote shows no PR segment either', async ($, on) => {
+  const w: World = { branch: BRANCH, prs: [pr(41)] }
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(w.prCalls).toBe(undefined)
+  expect(await bandText($)).toBe('◆ #8423 | ⎇ feature/issue-8423')
+})
+
+for (const surface of SURFACES) {
+  test(`sync and PR sit right after the branch, before timer and agents, on ${surface}`, async ($, on) => {
+    const { clock } = world(on, {
+      branch: BRANCH, revList: '0\t0', remote: AZURE, prs: [pr(41)],
+      percent: 42, health: SAMPLE, agents: [{ id: 'a', status: 'running' }],
+    })
+    await start($, clock)
+    await submit($, '/prosuite-comandos:work-item 8423')
+    const segs = (await drawRows($, surface)).flat()
+    expect(segs.map(s => s.label.split(' ')[0])).toEqual(['◆', '⎇', '⇅', 'PR', '⏱', '🤖', 'ctx', 'cpu', 'ram', 'temp'])
+  })
+}
+
+test('az never runs during a render, only off the timer', async ($, on) => {
+  const w: World = { branch: BRANCH, remote: AZURE, prs: [pr(41)] }
+  const { clock } = world(on, w)
+  await $.turn.complete(turn())
+  for (const surface of SURFACES) await drawRows($, surface)
+  expect(w.prCalls).toBe(undefined)
+  expect(await bandText($)).toBe('◆ #8423 | ⎇ feature/issue-8423')
+  await clock.settle()
+  expect(w.prCalls).toBe(1)
+  expect(named(await drawRows($), 'PR').label).toBe('PR #41 ⏳ 0/0')
+})
+
+test('the PR is read at most once per 2 minutes per branch', async ($, on) => {
+  const w: World = { branch: BRANCH, remote: AZURE, prs: [] }
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(w.prCalls).toBe(1)
+  await $.turn.complete(turn()) // a refresh on the same branch does not read again
+  await clock.advance(100_000)
+  expect(w.prCalls).toBe(1)
+  await clock.advance(20_000)
+  expect(w.prCalls).toBe(2)
+})
+
+test('a branch change reads its PR right away', async ($, on) => {
+  const w: World = { branch: BRANCH, remote: AZURE, prs: [pr(41)] }
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(w.prCalls).toBe(1)
+  w.branch = 'feature/issue-9001'
+  await $.turn.complete(turn())
+  // Until the new branch is read, the old branch's PR is not shown.
+  expect((await drawRows($)).flat().some(s => s.label.startsWith('PR'))).toBe(false)
+  await clock.settle()
+  expect(w.prCalls).toBe(2)
+  expect(named(await drawRows($), 'PR').label).toBe('PR sin PR')
+})
+
+test('overlapping PR reads never start', async ($, on) => {
+  let release!: () => void
+  const w: World = { branch: BRANCH, remote: AZURE, prs: [], prGate: new Promise<void>(r => (release = r)) }
+  const { clock } = world(on, w)
+  await start($, clock)
+  w.branch = 'feature/issue-9001'
+  await $.turn.complete(turn())
+  await clock.advance(3 * MINUTE)
+  expect(w.prCalls).toBe(1)
+  release()
+  await clock.settle()
+})
+
+test('a failing PR read is silent and keeps the last value', async ($, on) => {
+  const w: World = { branch: BRANCH, remote: AZURE, prs: [pr(41, { reviewers: [reviewer(10)] })] }
+  const { clock } = world(on, w)
+  await start($, clock)
+  expect(named(await drawRows($), 'PR').label).toBe('PR #41 ✓ 1/1')
+  w.prs = undefined // not logged in, offline, az missing
+  await clock.advance(2 * MINUTE)
+  expect(w.prCalls).toBe(2)
+  expect(named(await drawRows($), 'PR').label).toBe('PR #41 ✓ 1/1')
+  w.prs = 'garbage'
+  await clock.advance(2 * MINUTE)
+  expect(w.prCalls).toBe(3)
+  expect(named(await drawRows($), 'PR').label).toBe('PR #41 ✓ 1/1')
+})
+
+test('muted is Catppuccin overlay0 in both flavors and on the terminal', () => {
+  const source = svgRow([{ icon: 'PR', value: 'sin PR', role: 'muted' }]).source
+  expect(source).toContain(`.r-muted{fill:${LATTE.overlay}}`)
+  expect(source).toContain(`.r-muted{fill:${MACCHIATO.overlay}}`)
+  expect(LATTE.overlay).toBe('#8c8fa1')
+  expect(MACCHIATO.overlay).toBe('#8087a2')
+  expect(ROLE_COLORS.muted).toBe(MACCHIATO.overlay)
+})
+
+test('the hourglass counts as two cells', () => {
+  expect(cellWidth('#41 ⏳ 1/2')).toBe(10)
 })

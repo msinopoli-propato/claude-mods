@@ -4,9 +4,12 @@ import type { Segment } from './segments'
 export const DOT = '●'
 export const SEGMENT_GAP = 2
 
-// Terminal cells: astral characters (emoji like 🤖) take two, the rest one.
+// The few BMP characters the band draws that render as wide emoji (⌚⌛⏩-⏬⏰⏳).
+const WIDE_BMP = /[⌚⌛⏩-⏬⏰⏳]/
+
+// Terminal cells: astral characters (emoji like 🤖) and wide BMP emoji (⏳) take two, the rest one.
 export const cellWidth = (text: string) =>
-  [...text].reduce((cells, char) => cells + ((char.codePointAt(0) ?? 0) > 0xffff ? 2 : 1), 0)
+  [...text].reduce((cells, char) => cells + ((char.codePointAt(0) ?? 0) > 0xffff || WIDE_BMP.test(char) ? 2 : 1), 0)
 
 // The runs a terminal segment draws, in order: dot, padded icon, the bar of a percent gauge, value.
 export const segmentRuns = ({ icon, value, percent }: Pick<Segment, 'icon' | 'value' | 'percent'>) => ({

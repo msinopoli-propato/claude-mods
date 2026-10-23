@@ -29,7 +29,7 @@ export const MACCHIATO = {
 export type Flavor = { readonly [K in keyof typeof LATTE]: string }
 
 // What a segment means; the palette decides how it looks.
-export type Role = 'workItem' | 'branch' | 'timer' | 'ok' | 'warning' | 'error'
+export type Role = 'workItem' | 'branch' | 'timer' | 'ok' | 'warning' | 'error' | 'muted'
 
 export const ROLE_HUES: Record<Role, keyof Flavor> = {
   workItem: 'mauve',
@@ -38,6 +38,7 @@ export const ROLE_HUES: Record<Role, keyof Flavor> = {
   ok: 'green',
   warning: 'yellow',
   error: 'red',
+  muted: 'overlay',
 }
 
 // The terminal's role colors: Macchiato, whatever the terminal's theme (it has no keys for these hues).

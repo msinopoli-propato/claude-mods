@@ -31,6 +31,34 @@ export type SessionStatusRun = {
   activeMs: number
 }
 
+/**
+ * How the branch stands against its upstream, from local refs only (as fresh as the last fetch);
+ * `'local'` when it has no upstream yet.
+ */
+export type SessionStatusSync = { ahead: number; behind: number } | 'local'
+
+/** The pull request state shown in the band. */
+export type SessionStatusPullRequestState =
+  | 'none'
+  | 'draft'
+  | 'waiting'
+  | 'changes'
+  | 'approved'
+  | 'completed'
+  | 'abandoned'
+
+/**
+ * The newest Azure DevOps pull request of `branch`, as last read. `approved` counts person reviewers
+ * voting 5 or 10, `reviewers` every person reviewer (groups left out); `id` is null for `none`.
+ */
+export type SessionStatusPullRequest = {
+  branch: string
+  state: SessionStatusPullRequestState
+  id: number | null
+  approved: number
+  reviewers: number
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'session-status': {
@@ -40,6 +68,8 @@ declare module 'claude-code' {
       agents: SessionStatusAgents
       health: SessionStatusHealth | null
       run: SessionStatusRun | null
+      sync: SessionStatusSync | null
+      pr: SessionStatusPullRequest | null
     }
   }
 }

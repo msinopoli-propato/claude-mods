@@ -1,12 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface as Engine, Register } from 'claude-code'
 
-import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun } from '../types'
+import type { SessionStatusBranch, SessionStatusContext, SessionStatusRun, SessionStatusSync } from '../types'
 import { markEnded, mergeList, seedAgent } from './agents'
 import { HEALTH_ARGV, parseHealth } from './health'
 import { MACCHIATO, ROLE_COLORS } from './palette'
+import { PR_INTERVAL_MS, PR_TIMEOUT_MS, TRUSTED_CWD, parseAzureRemote, parsePullRequests, prArgv } from './pull-request'
 import { buildBand } from './segments'
 import { rowAlt, svgRow } from './svg-band'
+import { SYNC_ARGS, parseSync } from './sync'
 import { SEGMENT_GAP, cardLeft, segmentRuns } from './text-band'
 import { AZ_TIMEOUT_MS, azArgv, composeTitle, parseWorkItemTitle, titleKey } from './title'
 import type { Segment } from './segments'
@@ -40,6 +42,8 @@ const context = atom({ plugin: 'session-status', key: 'context' } as const, null
 const agents = atom({ plugin: 'session-status', key: 'agents' } as const, {})
 const health = atom({ plugin: 'session-status', key: 'health' } as const, null)
 const run = atom({ plugin: 'session-status', key: 'run' } as const, null)
+const sync = atom({ plugin: 'session-status', key: 'sync' } as const, null)
+const pr = atom({ plugin: 'session-status', key: 'pr' } as const, null)
 
 const SECTION_ID = 'session-status:wi-time'
 
@@ -47,8 +51,10 @@ const SECTION_ID = 'session-status:wi-time'
 // completed with every element name, a missing one drawing as a fragment, so the terminal's Svg draws nothing.
 const SVG_SURFACES: ReadonlySet<string> = new Set(['desktop', 'vscode', 'mobile'])
 
+const GIT_TIMEOUT_MS = 5000
+
 const git = async ($: Engine, args: readonly string[]) => {
-  const { exitCode, stdout } = await $.process.run(['git', ...args], { timeoutMs: 5000 })
+  const { exitCode, stdout } = await $.process.run(['git', ...args], { timeoutMs: GIT_TIMEOUT_MS })
   return exitCode === 0 ? stdout.trim() : undefined
 }
 
@@ -57,6 +63,18 @@ const readBranch = async ($: Engine): Promise<SessionStatusBranch | undefined> =
   if (!name) return undefined
   const changes = await git($, ['status', '--porcelain'])
   return { name, isDirty: Boolean(changes) }
+}
+
+// Ahead/behind from local refs. Called only once the branch read succeeded, so a failing rev-list means
+// no upstream. A detached HEAD has no sync to show.
+const readSync = async ($: Engine, name: string, cwd: string): Promise<SessionStatusSync | null> => {
+  if (name === 'HEAD') return null
+  try {
+    const { exitCode, stdout } = await $.process.run(['git', ...SYNC_ARGS], { cwd, timeoutMs: GIT_TIMEOUT_MS })
+    return exitCode === 0 ? (parseSync(stdout) ?? null) : 'local'
+  } catch {
+    return null
+  }
 }
 
 const detectWorkItem = (name: string | undefined, cwd: string) =>
@@ -72,12 +90,19 @@ const refresh = async ($: Engine) => {
   const { percent, tokens } = usage.context
   const ctx: SessionStatusContext | null =
     percent === undefined ? null : { percent, tokens: tokens ?? null }
+  const [previous, currentSync] = await Promise.all([
+    read($, branch),
+    current ? readSync($, current.name, cwd) : null,
+  ])
 
   await Promise.all([
     update($, branch, () => current ?? null),
+    update($, sync, () => currentSync),
     update($, workItem, () => detectWorkItem(current?.name, cwd) ?? null),
     update($, context, () => ctx),
   ])
+  // A new branch gets its PR read right away, off the hook chain that refreshed it.
+  if (current && current.name !== previous?.name) $.clock.after(0, () => void readPullRequest($))
 }
 
 // The work item a command run belongs to: its args first, then the branch or worktree.
@@ -164,6 +189,39 @@ const readCachedTitle = async ($: Engine, id: string | null | undefined) => {
   return typeof cached === 'string' ? cached : null
 }
 
+// The branch's Azure DevOps PR (read-only), off the timer or a clock.after only: never in a hook chain or a
+// render. One read at a time, at most once per PR_INTERVAL_MS per branch; a hot reload resets both guards.
+let isReadingPr = false
+const prReads = new Map<string, number>()
+
+async function readPullRequest($: Engine) {
+  if (isReadingPr) return
+  isReadingPr = true
+  try {
+    const name = (await read($, branch))?.name
+    if (!name || name === 'HEAD') return
+    const now = await $.clock.now()
+    const last = prReads.get(name)
+    if (last !== undefined && now - last < PR_INTERVAL_MS) return
+    prReads.set(name, now)
+
+    const cwd = await $.session.cwd()
+    // Only Azure DevOps repos have a PR to show; GitHub and the rest show no segment.
+    const remote = await $.process.run(['git', 'remote', 'get-url', 'origin'], { cwd, timeoutMs: GIT_TIMEOUT_MS })
+    const repo = remote.exitCode === 0 ? parseAzureRemote(remote.stdout) : undefined
+    const argv = repo && prArgv({ ...repo, branch: name })
+    if (!argv) return
+
+    const { exitCode, stdout } = await $.process.run(argv, { cwd: TRUSTED_CWD, timeoutMs: PR_TIMEOUT_MS })
+    const summary = exitCode === 0 ? parsePullRequests(stdout, name) : undefined
+    if (summary) await update($, pr, () => ({ branch: name, ...summary }))
+  } catch {
+    // Not logged in, offline, az missing: silent, the last value stays.
+  } finally {
+    isReadingPr = false
+  }
+}
+
 // Merges the engine's agent list into the session tally; callers never let a failure reach a turn or tool call.
 // Serialized: a request that arrives while a read is in flight waits for it plus one fresh rerun, so a stale
 // list can never overwrite a newer one.
@@ -189,9 +247,9 @@ const syncAgents = ($: Engine): Promise<void> => {
   return agentSync
 }
 
-// One timer period: both reads run off the timer, never inside a hook chain.
+// One timer period: every read runs off the timer, never inside a hook chain.
 const poll = async ($: Engine) => {
-  await Promise.all([readHealth($), syncAgents($).catch(() => undefined)])
+  await Promise.all([readHealth($), syncAgents($).catch(() => undefined), readPullRequest($)])
 }
 
 export const register: Register = on => {
@@ -291,14 +349,17 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
 
-    const [currentBranch, branchItem, currentContext, currentAgents, currentHealth, currentRun] = await Promise.all([
-      read($, branch),
-      read($, workItem),
-      read($, context),
-      read($, agents),
-      read($, health),
-      read($, run),
-    ])
+    const [currentBranch, branchItem, currentContext, currentAgents, currentHealth, currentRun, currentSync, currentPr] =
+      await Promise.all([
+        read($, branch),
+        read($, workItem),
+        read($, context),
+        read($, agents),
+        read($, health),
+        read($, run),
+        read($, sync),
+        read($, pr),
+      ])
     const band = buildBand({
       branch: currentBranch,
       workItem: branchItem,
@@ -307,6 +368,8 @@ export const register: Register = on => {
       agents: currentAgents,
       health: currentHealth,
       run: currentRun,
+      sync: currentSync,
+      pr: currentPr,
     })
     // One row: the work segments, then the gauges.
     const rows = [[...band.work, ...band.gauges]].filter(row => row.length > 0)
